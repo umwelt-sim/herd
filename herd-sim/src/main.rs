@@ -21,7 +21,13 @@
 //!
 //! Step 3 registers viewers, which is where the cost of a tick actually lives:
 //! everything before this moves entities and rebuilds a snapshot, and none of
-//! it depends on anyone watching. Health follows.
+//! it depends on anyone watching.
+//!
+//! Step 4 adds health. A crowded cell hurts what stands in it, so a crowd thins
+//! from wherever it is densest, and a spawner refills the region. Health never
+//! reaches a client, since a record carries a position and nothing else and the
+//! opaque payload a consumer would put its own fields in is not built. What
+//! reaches a client is the despawn.
 
 use umwelt::{
     CellId, ClientLimits, DistSq, EntityId, Fixed, Flow, Game, Pacing, Pos2, Pos3, Step, TickStats,
@@ -97,6 +103,40 @@ const DWELL_S: (i32, i32) = (5, 60);
 /// consider going, so a slow class stays local and a fast one crosses the
 /// region. A guess.
 const HORIZON_S: i32 = 60;
+
+/// Health an entity spawns with, and the most it recovers to.
+const HEALTH_MAX: i16 = 30_000;
+
+/// Entities in a cell before it starts hurting them.
+///
+/// Measured over five simulated minutes: 400 thins the fullest cell to 799 and
+/// kills 50.7 a second, 2,500 kills nobody, and 1,500 kills 6.1 a second while
+/// leaving the fullest cell at 1,592 against the 1,852 that movement alone
+/// settles at. Deaths exercise the despawn path; thinning the crowds removes
+/// the load this binary exists to produce.
+const CROWD_THRESHOLD: usize = 1_500;
+
+/// Crowding damage per tick is the excess over the threshold divided by this.
+/// Sized so that a cell of three thousand kills in about a minute of standing
+/// in it, which is longer than the mean dwell: an entity that keeps moving
+/// survives, and one that keeps choosing the densest place does not. A guess.
+const DAMAGE_DIVISOR: usize = 100;
+
+/// Health recovered per tick anywhere below the threshold.
+const REGEN: i16 = 5;
+
+/// Mean seconds an entity lives before it dies of nothing in particular.
+///
+/// Crowding damage stops once a crowd thins to the threshold, so on its own it
+/// gives a burst of deaths and then none. This gives churn that does not depend
+/// on density: the region loses `population / lifespan` per tick, which at
+/// 50,000 entities and forty minutes is about 21 a second. A guess, and the
+/// dial for how much despawn traffic a run carries.
+const LIFESPAN_S: u32 = 2_400;
+
+/// The most the spawner replaces in one tick, so a die-off refills over several
+/// ticks instead of arriving as one spike.
+const MAX_SPAWNS_PER_TICK: usize = 64;
 
 /// Motion classes as (share in percent, meters per second, and thousandths).
 /// Carried over from umwelt's quality harness, where the mix is **chosen rather
@@ -206,14 +246,44 @@ struct Herd {
     /// Entities that both move and belong somewhere. Clients are drawn from
     /// these, so a viewer takes part in the cycle instead of watching it.
     residents: Vec<u32>,
+    health: Vec<i16>,
+    /// The tick each entity dies on, whatever else happens to it.
+    dies_at: Vec<u32>,
+    /// Population by cell, rebuilt every tick. umwelt keeps a cell-ordered
+    /// snapshot of exactly this, but a `Step` hands out positions and liveness
+    /// and no way to ask where anything is, so a consumer that wants to know
+    /// counts for itself.
+    occupancy: Vec<u32>,
+    /// Scratch, so a tick that kills nothing allocates nothing.
+    dead: Vec<EntityId>,
+    /// What the spawner refills toward.
+    target: usize,
+    /// Mean ticks lived.
+    ///
+    /// A population that starts together is given ages spread over one of
+    /// these, so the region loses `population / lifespan` per tick from the
+    /// first tick rather than after a wait. Replacements draw uniformly over
+    /// half to one and a half, which keeps the mean and stops a burst of
+    /// deaths from echoing as a second burst one lifespan later.
+    lifespan: u32,
+    /// Crowding damage per tick is the excess over this divided by
+    /// `damage_divisor`. It sets the crowd size deaths settle at, which is what
+    /// a load generator is really choosing: a threshold well under the crowd
+    /// thins it to the threshold, and one above it kills nobody.
+    crowd_threshold: usize,
+    damage_divisor: usize,
+    /// Cumulative counts, reported rather than guessed at.
+    pub deaths: u64,
+    pub births: u64,
     rng: Rng,
     lo: i32,
     hi: i32,
     tick_hz: i32,
+    cfg: WorldConfig,
 }
 
 impl Herd {
-    fn new(cfg: &WorldConfig, n: usize, seed: u64) -> Herd {
+    fn new(cfg: &WorldConfig, n: usize, seed: u64, lifespan: u32) -> Herd {
         let mut rng = Rng::new(seed);
         let lo = Fixed::from_meters(MARGIN_M).raw();
         let hi = cfg.region_size().raw() - lo;
@@ -245,10 +315,21 @@ impl Herd {
             home: vec![None; n],
             phase_at: vec![true; n],
             residents: Vec::new(),
+            health: vec![HEALTH_MAX; n],
+            dies_at: Vec::with_capacity(n),
+            occupancy: vec![0; cfg.cells_per_region() as usize],
+            dead: Vec::new(),
+            target: n,
+            lifespan,
+            crowd_threshold: CROWD_THRESHOLD,
+            damage_divisor: DAMAGE_DIVISOR,
+            deaths: 0,
+            births: 0,
             rng,
             lo,
             hi,
             tick_hz: hz,
+            cfg: *cfg,
         };
 
         for i in 0..n {
@@ -273,6 +354,8 @@ impl Herd {
                 )
             };
             herd.pending.push(at.at_height(Fixed::from_raw(herd.rng.below(vertical) as i32)));
+            let dies_at = 1 + herd.rng.below(herd.lifespan);
+            herd.dies_at.push(dies_at);
             herd.retarget(i, at, true);
         }
         herd
@@ -358,6 +441,70 @@ impl Herd {
     fn residents(&self) -> &[u32] {
         &self.residents
     }
+
+    /// Slots ever allocated. umwelt never reuses one, and reports how many are
+    /// live rather than how many exist, so the game's own arrays are the
+    /// measure of what a long run has grown to.
+    fn slots(&self) -> usize {
+        self.health.len()
+    }
+
+    /// Replaces one entity. Slots are never reused, so this appends to every
+    /// array the game keeps beside umwelt's own, and a long run grows all of
+    /// them for as long as anything dies.
+    fn spawn_one(&mut self, w: &mut Step<'_>, gathering: bool) {
+        let i = w.slots();
+        let (m, milli) = {
+            let roll = self.rng.below(100);
+            let mut acc = 0;
+            let mut class = MIX.len() - 1;
+            for (k, (share, _, _)) in MIX.iter().enumerate() {
+                acc += share;
+                if roll < acc {
+                    class = k;
+                    break;
+                }
+            }
+            (MIX[class].1, MIX[class].2)
+        };
+        let speed = Fixed::from_millis(m, milli).raw() / self.tick_hz;
+
+        let resident = speed > 0 && self.rng.below(16) < SPAWN_AT_ATTRACTOR_IN_16;
+        let home = resident.then(|| self.rng.below(ATTRACTORS as u32) as u8);
+        let at = match home {
+            Some(h) => {
+                let a = self.attractors[h as usize];
+                self.offset(a, Fixed::from_meters(ATTRACTOR_RADIUS_M).raw())
+            }
+            None => Pos2::new(
+                Fixed::from_raw(rng_in(&mut self.rng, self.lo, self.hi)),
+                Fixed::from_raw(rng_in(&mut self.rng, self.lo, self.hi)),
+            ),
+        };
+        let vertical = self.cfg.vertical_extent().raw() as u32;
+        let z = Fixed::from_raw(self.rng.below(vertical) as i32);
+
+        self.vel_x.push(0);
+        self.vel_y.push(0);
+        self.speed.push(speed);
+        self.dest.push(at);
+        self.horizon.push(speed.saturating_mul(HORIZON_S * self.tick_hz));
+        self.wait.push(0);
+        self.dwell.push(0);
+        self.home.push(home);
+        self.phase_at.push(gathering);
+        self.health.push(HEALTH_MAX);
+        let dies_at =
+            w.tick().wrapping_add(self.lifespan / 2 + 1 + self.rng.below(self.lifespan));
+        self.dies_at.push(dies_at);
+
+        let id = w.spawn(at.at_height(z));
+        assert_eq!(id.index(), i, "spawn appends, so the game's arrays stay parallel");
+        if home.is_some() {
+            self.residents.push(i as u32);
+        }
+        self.retarget(i, at, gathering);
+    }
 }
 
 /// A coordinate in `lo..=hi`, raw.
@@ -376,8 +523,21 @@ impl Game for Herd {
             return;
         }
 
+        // Slots are never reused, so this walks every entity that ever lived
+        // and tests each. `LiveSet` has no iterator over the live ones, which
+        // is the cost the design document's word-level skipping note is about,
+        // arriving from the consumer side.
+        let live = w.live().clone();
+        let tick = w.tick();
+        let cfg = self.cfg;
+        let cells = cfg.cells_per_axis() as usize;
+        self.occupancy.fill(0);
+
         let (xs, ys, _) = w.positions_mut();
         for i in 0..xs.len() {
+            if !live.contains(EntityId::from_raw(i as u32)) {
+                continue;
+            }
             if self.speed[i] == 0 {
                 continue;
             }
@@ -408,7 +568,51 @@ impl Game for Herd {
             xs[i] = Fixed::from_raw(xs[i].raw() + self.vel_x[i]);
             ys[i] = Fixed::from_raw(ys[i].raw() + self.vel_y[i]);
         }
+
+        // Where everything ended up, so crowding is measured after the move.
+        for i in 0..xs.len() {
+            if live.contains(EntityId::from_raw(i as u32)) {
+                self.occupancy[cell_index(&cfg, xs[i], ys[i], cells)] += 1;
+            }
+        }
+
+        self.dead.clear();
+        for i in 0..xs.len() {
+            let id = EntityId::from_raw(i as u32);
+            if !live.contains(id) {
+                continue;
+            }
+            let crowd = self.occupancy[cell_index(&cfg, xs[i], ys[i], cells)] as usize;
+            self.health[i] = if crowd > self.crowd_threshold {
+                let hurt = ((crowd - self.crowd_threshold) / self.damage_divisor) as i16;
+                self.health[i].saturating_sub(hurt)
+            } else {
+                self.health[i].saturating_add(REGEN).min(HEALTH_MAX)
+            };
+            if self.health[i] <= 0 || tick >= self.dies_at[i] {
+                self.dead.push(id);
+            }
+        }
+
+        for id in core::mem::take(&mut self.dead) {
+            w.despawn(id);
+            self.deaths += 1;
+        }
+
+        // Refill toward the population the region was built with, a few at a
+        // time so a die-off does not arrive back as one spike.
+        let missing = self.target.saturating_sub(w.live().live());
+        for _ in 0..missing.min(MAX_SPAWNS_PER_TICK) {
+            self.spawn_one(w, gathering);
+            self.births += 1;
+        }
     }
+}
+
+/// Which cell a position falls in, by umwelt's own arithmetic, flattened.
+fn cell_index(cfg: &WorldConfig, x: Fixed, y: Fixed, per_axis: usize) -> usize {
+    let c = cfg.cell_of(Pos2::new(x, y));
+    c.y as usize * per_axis + c.x as usize
 }
 
 /// A run's tick stats, summed. `TickStats::merge` is private to umwelt, so a
@@ -435,22 +639,15 @@ impl Totals {
 /// see. The checkpoint for movement: whether crowds form on their own.
 struct Occupancy {
     max: usize,
-    top_share: f64,
 }
 
 fn occupancy(sim: &WorldSimulation<Herd>) -> Occupancy {
     let snap = sim.snapshot();
     let cells = snap.cell_count();
-    let mut counts: Vec<usize> = (0..cells)
+    let counts: Vec<usize> = (0..cells)
         .map(|i| snap.entities_for_cell(CellId::from_raw(i as u32)).len())
         .collect();
-    let total: usize = counts.iter().sum();
-    counts.sort_unstable_by(|a, b| b.cmp(a));
-    let top: usize = counts.iter().take(ATTRACTORS).sum();
-    Occupancy {
-        max: counts.first().copied().unwrap_or(0),
-        top_share: if total == 0 { 0.0 } else { top as f64 / total as f64 },
-    }
+    Occupancy { max: counts.iter().copied().max().unwrap_or(0) }
 }
 
 fn main() {
@@ -459,6 +656,9 @@ fn main() {
     let mut threads = None;
     let mut entities = ENTITIES;
     let mut viewers = VIEWERS;
+    let mut damage = DAMAGE_DIVISOR;
+    let mut crowd = CROWD_THRESHOLD;
+    let mut lifespan = LIFESPAN_S;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -467,6 +667,9 @@ fn main() {
             "--threads" => threads = args.next().and_then(|n| n.parse().ok()),
             "--entities" => entities = args.next().and_then(|n| n.parse().ok()).unwrap_or(entities),
             "--viewers" => viewers = args.next().and_then(|n| n.parse().ok()).unwrap_or(viewers),
+            "--damage" => damage = args.next().and_then(|n| n.parse().ok()).unwrap_or(damage),
+            "--crowd" => crowd = args.next().and_then(|n| n.parse().ok()).unwrap_or(crowd),
+            "--lifespan" => lifespan = args.next().and_then(|n| n.parse().ok()).unwrap_or(lifespan),
             other => match other.parse() {
                 Ok(n) => ticks = n,
                 Err(_) => {
@@ -481,7 +684,10 @@ fn main() {
     let report_every = (ticks / REPORTS).max(1);
 
     let cfg = WorldConfig::default();
-    let mut sim = WorldSimulation::new(cfg, Herd::new(&cfg, entities, SEED));
+    let mut game = Herd::new(&cfg, entities, SEED, lifespan * cfg.tick_hz());
+    game.damage_divisor = damage;
+    game.crowd_threshold = crowd;
+    let mut sim = WorldSimulation::new(cfg, game);
     if let Some(n) = threads {
         sim.set_thread_count(n);
     }
@@ -526,8 +732,8 @@ fn main() {
     );
     println!();
     println!(
-        "{:>6} {:>10} {:>9} {:>7} {:>7} {:>7} {:>8} {:>8}",
-        "tick", "phase", "max cell", "top 8", "cand", "rec", "work ms", "worst ms"
+        "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>8}",
+        "tick", "phase", "max cell", "alive", "deaths", "cand", "rec", "dep", "desp", "work ms"
     );
 
     let period = std::time::Duration::from_nanos(1_000_000_000 / cfg.tick_hz() as u64);
@@ -540,6 +746,7 @@ fn main() {
     // Worst tick since the last report line, so a spike can be placed against
     // the phase it happened in rather than only counted at the end.
     let mut window_worst = std::time::Duration::ZERO;
+    let mut peak_cell = 0usize;
 
     // umwelt owns the loop: it has the tick rate, so it keeps the schedule.
     let summary = sim.run(Pacing { wait, ticks: Some(ticks), ..Pacing::default() }, |r, sim| {
@@ -566,17 +773,20 @@ fn main() {
             } else {
                 "dispersing"
             };
+            peak_cell = peak_cell.max(o.max);
             let served = r.stats.viewers.max(1) as f64;
             println!(
-                "{:>6} {:>10} {:>9} {:>6.1}% {:>7.1} {:>7.1} {:>8.2} {:>8.2}",
+                "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7.1} {:>7.1} {:>7.2} {:>7.2} {:>8.2}",
                 r.tick,
                 phase,
                 o.max,
-                100.0 * o.top_share,
+                sim.entity_count(),
+                sim.game().deaths,
                 r.stats.candidates as f64 / served,
                 r.stats.records as f64 / served,
-                r.took.as_secs_f64() * 1000.0,
-                window_worst.as_secs_f64() * 1000.0
+                r.stats.departed as f64 / served,
+                r.stats.despawns_sent as f64 / served,
+                r.took.as_secs_f64() * 1000.0
             );
             window_worst = std::time::Duration::ZERO;
         }
@@ -631,5 +841,18 @@ fn main() {
     println!(
         "totals: {} viewers served, {} candidates, {} records, {} bytes",
         totals.viewers, totals.candidates, totals.records, totals.bytes
+    );
+    let seconds = summary.ticks as f64 / cfg.tick_hz() as f64;
+    println!(
+        "population: {} alive of {entities}, {} died and {} spawned, {:.1} deaths per second, {} slots ever allocated",
+        sim.entity_count(),
+        sim.game().deaths,
+        sim.game().births,
+        sim.game().deaths as f64 / seconds.max(1.0),
+        sim.game().slots()
+    );
+    println!(
+        "crowding: fullest cell peaked at {peak_cell} and ended at {}, against a threshold of {crowd}",
+        occupancy(&sim).max
     );
 }
