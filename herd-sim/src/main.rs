@@ -624,6 +624,7 @@ struct Totals {
     candidates: u64,
     records: u64,
     bytes: u64,
+    subs_changed: u64,
 }
 
 impl Totals {
@@ -632,6 +633,7 @@ impl Totals {
         self.candidates += s.candidates;
         self.records += s.records;
         self.bytes += s.bytes;
+        self.subs_changed += s.subs_changed;
     }
 }
 
@@ -841,6 +843,11 @@ fn main() {
     println!(
         "totals: {} viewers served, {} candidates, {} records, {} bytes",
         totals.viewers, totals.candidates, totals.records, totals.bytes
+    );
+    println!(
+        "subscriptions: {} changed, {:.2}% of viewers served, which is how often one crossed a cell",
+        totals.subs_changed,
+        100.0 * totals.subs_changed as f64 / totals.viewers.max(1) as f64
     );
     let seconds = summary.ticks as f64 / cfg.tick_hz() as f64;
     println!(
