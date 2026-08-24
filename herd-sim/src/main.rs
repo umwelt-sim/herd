@@ -23,6 +23,10 @@
 //! everything before this moves entities and rebuilds a snapshot, and none of
 //! it depends on anyone watching.
 //!
+//! Step 7 of umwelt's build order is a bot harness, which is this binary with
+//! its movement replaced. A pattern is hostile on purpose and is meant to break
+//! something: a pattern that misses a deadline is a result, not a failed run.
+//!
 //! Step 4 adds health. A crowded cell hurts what stands in it, so a crowd thins
 //! from wherever it is densest, and a spawner refills the region. Health never
 //! reaches a client, since a record carries a position and nothing else and the
@@ -124,6 +128,68 @@ const DAMAGE_DIVISOR: usize = 100;
 
 /// Health recovered per tick anywhere below the threshold.
 const REGEN: i16 = 5;
+
+/// How the population moves. `Herd` is a plausible world; the rest exist to
+/// break something in particular.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pattern {
+    /// Attractors, dwell, and a gather and disperse cycle.
+    Herd,
+    /// Everything converges on one cell and stays. Against the walk cap and the
+    /// gather, while a crowd is forming rather than once it has formed.
+    Flash,
+    /// Every entity astride a cell boundary, stepping across it each tick.
+    /// Against subscription churn, which a plausible world leaves at 0.23% of
+    /// viewers a tick.
+    Flap,
+    /// Entities oscillating in and out of the range a viewer holds ghosts for.
+    /// Against `grace` and the departure queue, which is where the one real bug
+    /// the pipeline benchmark caught lived.
+    Thrash,
+    /// A share of the population jumping the region every tick. Against the
+    /// accumulator: a jump is the most drift an entity can have, so every one
+    /// of them outranks everything else for a packet slot.
+    Teleport,
+    /// A quarter of the population dying at once, periodically. Against the
+    /// despawn queue and the half-packet cap on despawn records.
+    Cull,
+}
+
+impl Pattern {
+    fn parse(s: &str) -> Option<Pattern> {
+        Some(match s {
+            "herd" => Pattern::Herd,
+            "flash" => Pattern::Flash,
+            "flap" => Pattern::Flap,
+            "thrash" => Pattern::Thrash,
+            "teleport" => Pattern::Teleport,
+            "cull" => Pattern::Cull,
+            _ => return None,
+        })
+    }
+}
+
+/// Meters either side of a cell boundary a [`Pattern::Flap`] entity steps.
+const FLAP_M: i32 = 2;
+
+/// Meters per second a [`Pattern::Flash`] entity moves. A crowd that takes
+/// twenty minutes to gather is not a flash crowd, and at the plausible mix's
+/// walking pace crossing the region takes that long.
+const FLASH_SPEED: i32 = 60;
+
+/// Meters per second a [`Pattern::Thrash`] entity moves, chosen so that a
+/// hundred meter swing takes a few seconds rather than a minute.
+const THRASH_SPEED: i32 = 20;
+
+/// How far out a [`Pattern::Thrash`] entity swings from its attractor.
+const THRASH_FAR_M: i32 = 100;
+
+/// Entities per thousand that jump each tick under [`Pattern::Teleport`].
+const TELEPORT_PER_MILLE: usize = 1;
+
+/// Seconds between [`Pattern::Cull`] events, and the share that dies in one.
+const CULL_PERIOD_S: u32 = 30;
+const CULL_IN_16: u32 = 4;
 
 /// Mean seconds an entity lives before it dies of nothing in particular.
 ///
@@ -258,6 +324,7 @@ struct Herd {
     dead: Vec<EntityId>,
     /// What the spawner refills toward.
     target: usize,
+    pattern: Pattern,
     /// Mean ticks lived.
     ///
     /// A population that starts together is given ages spread over one of
@@ -283,7 +350,7 @@ struct Herd {
 }
 
 impl Herd {
-    fn new(cfg: &WorldConfig, n: usize, seed: u64, lifespan: u32) -> Herd {
+    fn new(cfg: &WorldConfig, n: usize, seed: u64, lifespan: u32, pattern: Pattern) -> Herd {
         let mut rng = Rng::new(seed);
         let lo = Fixed::from_meters(MARGIN_M).raw();
         let hi = cfg.region_size().raw() - lo;
@@ -320,6 +387,7 @@ impl Herd {
             occupancy: vec![0; cfg.cells_per_region() as usize],
             dead: Vec::new(),
             target: n,
+            pattern,
             lifespan,
             crowd_threshold: CROWD_THRESHOLD,
             damage_divisor: DAMAGE_DIVISOR,
@@ -336,11 +404,22 @@ impl Herd {
             let roll = herd.rng.below(100);
             let class = cuts.iter().position(|&c| roll < c).unwrap_or(MIX.len() - 1);
             let (_, m, milli) = MIX[class];
-            herd.speed[i] = Fixed::from_millis(m, milli).raw() / hz;
+            herd.speed[i] = match pattern {
+                Pattern::Flap if m > 0 || milli > 0 => Fixed::from_meters(FLAP_M).raw(),
+                Pattern::Flash if m > 0 || milli > 0 => {
+                    Fixed::from_meters(FLASH_SPEED).raw() / hz
+                }
+                Pattern::Thrash if m > 0 || milli > 0 => {
+                    Fixed::from_meters(THRASH_SPEED).raw() / hz
+                }
+                _ => Fixed::from_millis(m, milli).raw() / hz,
+            };
             herd.horizon[i] = herd.speed[i].saturating_mul(HORIZON_S * hz);
 
-            let resident =
-                herd.speed[i] > 0 && herd.rng.below(16) < SPAWN_AT_ATTRACTOR_IN_16;
+            // Every pattern but the plausible one needs viewers to draw from,
+            // and draws them from whatever moves.
+            let resident = herd.speed[i] > 0
+                && (pattern != Pattern::Herd || herd.rng.below(16) < SPAWN_AT_ATTRACTOR_IN_16);
             let at = if resident {
                 let h = herd.rng.below(ATTRACTORS as u32) as u8;
                 herd.home[i] = Some(h);
@@ -352,6 +431,16 @@ impl Herd {
                     Fixed::from_raw(rng_in(&mut herd.rng, lo, hi)),
                     Fixed::from_raw(rng_in(&mut herd.rng, lo, hi)),
                 )
+            };
+            // Flapping needs somewhere to flap across, so it starts a meter
+            // inside a cell with the boundary a step away.
+            let at = if pattern == Pattern::Flap && herd.speed[i] > 0 {
+                let cell = cfg.cell_size().raw();
+                let edge = (at.x.raw() / cell + 1) * cell;
+                let inside = Fixed::from_meters(1).raw();
+                Pos2::new(Fixed::from_raw((edge - inside).clamp(lo, hi)), at.y)
+            } else {
+                at
             };
             herd.pending.push(at.at_height(Fixed::from_raw(herd.rng.below(vertical) as i32)));
             let dies_at = 1 + herd.rng.below(herd.lifespan);
@@ -370,6 +459,10 @@ impl Herd {
             return;
         }
         let hz = self.tick_hz;
+        if let Some(dest) = self.pattern_dest(i, at) {
+            self.aim(i, at, dest);
+            return;
+        }
         let dest = match self.home[i] {
             // A resident goes home to gather and spreads around home to
             // disperse, so its crowd returns to the same size every cycle.
@@ -409,6 +502,36 @@ impl Herd {
             }
         };
 
+        self.aim(i, at, dest);
+    }
+
+    /// Where a hostile pattern sends an entity, or `None` for the plausible
+    /// one, which has its own rules.
+    fn pattern_dest(&mut self, i: usize, at: Pos2) -> Option<Pos2> {
+        let radius = Fixed::from_meters(ATTRACTOR_RADIUS_M).raw();
+        match self.pattern {
+            Pattern::Herd | Pattern::Teleport | Pattern::Cull | Pattern::Flap => None,
+            // One cell, everyone, no dwell.
+            Pattern::Flash => {
+                self.dwell[i] = 0;
+                Some(self.offset(self.attractors[0], radius))
+            }
+            // In to the attractor, then out past where a viewer standing in it
+            // still holds a ghost, then back.
+            Pattern::Thrash => {
+                let a = self.attractors[self.home[i].unwrap_or(0) as usize];
+                let far = Fixed::from_meters(THRASH_FAR_M).raw();
+                let out = at.dist_sq(a) > DistSq::from_radius(Fixed::from_raw(far / 2));
+                self.dwell[i] = 0;
+                Some(self.offset(a, if out { radius } else { far }))
+            }
+        }
+    }
+
+    /// Points an entity at a destination and builds the velocity that walks it
+    /// there. One divide, paid on arrival rather than per tick.
+    fn aim(&mut self, i: usize, at: Pos2, dest: Pos2) {
+        let speed = self.speed[i];
         let dx = (dest.x.raw() - at.x.raw()) as i64;
         let dy = (dest.y.raw() - at.y.raw()) as i64;
         let dist = at.dist_sq(dest).sqrt_approx().raw() as i64;
@@ -541,6 +664,14 @@ impl Game for Herd {
             if self.speed[i] == 0 {
                 continue;
             }
+            // Flapping does not walk anywhere: it steps back and forth across
+            // the boundary it was placed on, one crossing a tick.
+            if self.pattern == Pattern::Flap {
+                let step = if self.phase_at[i] { self.speed[i] } else { -self.speed[i] };
+                self.phase_at[i] = !self.phase_at[i];
+                xs[i] = Fixed::from_raw(xs[i].raw() + step);
+                continue;
+            }
             let at = Pos2::new(xs[i], ys[i]);
             if self.phase_at[i] != gathering {
                 // A phase reaches everyone at once. Left to notice at the end
@@ -567,6 +698,32 @@ impl Game for Herd {
             }
             xs[i] = Fixed::from_raw(xs[i].raw() + self.vel_x[i]);
             ys[i] = Fixed::from_raw(ys[i].raw() + self.vel_y[i]);
+        }
+
+        match self.pattern {
+            Pattern::Teleport => {
+                let jumps = xs.len() * TELEPORT_PER_MILLE / 1_000;
+                for _ in 0..jumps {
+                    let i = self.rng.below(xs.len() as u32) as usize;
+                    if !live.contains(EntityId::from_raw(i as u32)) || self.speed[i] == 0 {
+                        continue;
+                    }
+                    xs[i] = Fixed::from_raw(rng_in(&mut self.rng, self.lo, self.hi));
+                    ys[i] = Fixed::from_raw(rng_in(&mut self.rng, self.lo, self.hi));
+                }
+            }
+            Pattern::Cull if tick % (CULL_PERIOD_S * self.tick_hz as u32) == 0 => {
+                for i in 0..xs.len() {
+                    if live.contains(EntityId::from_raw(i as u32))
+                        && self.rng.below(16) < CULL_IN_16
+                    {
+                        // Past anything regeneration can pull back: the health
+                        // pass runs after this one, and zero would survive it.
+                        self.health[i] = i16::MIN;
+                    }
+                }
+            }
+            _ => {}
         }
 
         // Where everything ended up, so crowding is measured after the move.
@@ -661,6 +818,7 @@ fn main() {
     let mut damage = DAMAGE_DIVISOR;
     let mut crowd = CROWD_THRESHOLD;
     let mut lifespan = LIFESPAN_S;
+    let mut pattern = Pattern::Herd;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -672,6 +830,12 @@ fn main() {
             "--damage" => damage = args.next().and_then(|n| n.parse().ok()).unwrap_or(damage),
             "--crowd" => crowd = args.next().and_then(|n| n.parse().ok()).unwrap_or(crowd),
             "--lifespan" => lifespan = args.next().and_then(|n| n.parse().ok()).unwrap_or(lifespan),
+            "--pattern" => {
+                pattern = args.next().as_deref().and_then(Pattern::parse).unwrap_or_else(|| {
+                    eprintln!("--pattern takes herd, flash, flap, thrash, teleport or cull");
+                    std::process::exit(2)
+                })
+            }
             other => match other.parse() {
                 Ok(n) => ticks = n,
                 Err(_) => {
@@ -686,7 +850,7 @@ fn main() {
     let report_every = (ticks / REPORTS).max(1);
 
     let cfg = WorldConfig::default();
-    let mut game = Herd::new(&cfg, entities, SEED, lifespan * cfg.tick_hz());
+    let mut game = Herd::new(&cfg, entities, SEED, lifespan * cfg.tick_hz(), pattern);
     game.damage_divisor = damage;
     game.crowd_threshold = crowd;
     let mut sim = WorldSimulation::new(cfg, game);
@@ -704,7 +868,7 @@ fn main() {
     }
 
     println!(
-        "herd-sim: {entities} entities, {} m region, {} m cells, {} Hz, {} workers",
+        "herd-sim: {pattern:?}, {entities} entities, {} m region, {} m cells, {} Hz, {} workers",
         cfg.region_size().floor_meters(),
         cfg.cell_size().floor_meters(),
         cfg.tick_hz(),
