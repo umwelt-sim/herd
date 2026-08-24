@@ -19,12 +19,18 @@
 //! for studying the population, where simulated minutes matter and wall clock
 //! does not.
 //!
-//! Viewers and health follow.
+//! Step 3 registers viewers, which is where the cost of a tick actually lives:
+//! everything before this moves entities and rebuilds a snapshot, and none of
+//! it depends on anyone watching. Health follows.
 
 use umwelt::{
-    CellId, DistSq, Fixed, Flow, Game, Pacing, Pos2, Pos3, Step, TickStats, Wait, WorldConfig,
-    WorldSimulation,
+    CellId, ClientLimits, DistSq, EntityId, Fixed, Flow, Game, Pacing, Pos2, Pos3, Step, TickStats,
+    Wait, WorldConfig, WorldSimulation,
 };
+
+/// Clients watching the region, unless the command line says otherwise. The
+/// count umwelt's benchmarks treat as the load a region has to carry.
+const VIEWERS: usize = 8_192;
 
 /// Entities the region carries. Matches the scale umwelt's own benchmarks
 /// report, so figures from here are comparable against them.
@@ -197,6 +203,9 @@ struct Herd {
     /// The phase the current destination was chosen under, so a change of
     /// phase can be noticed by an entity that is still walking.
     phase_at: Vec<bool>,
+    /// Entities that both move and belong somewhere. Clients are drawn from
+    /// these, so a viewer takes part in the cycle instead of watching it.
+    residents: Vec<u32>,
     rng: Rng,
     lo: i32,
     hi: i32,
@@ -235,6 +244,7 @@ impl Herd {
             dwell: vec![0; n],
             home: vec![None; n],
             phase_at: vec![true; n],
+            residents: Vec::new(),
             rng,
             lo,
             hi,
@@ -253,6 +263,7 @@ impl Herd {
             let at = if resident {
                 let h = herd.rng.below(ATTRACTORS as u32) as u8;
                 herd.home[i] = Some(h);
+                herd.residents.push(i as u32);
                 let a = herd.attractors[h as usize];
                 herd.offset(a, Fixed::from_meters(ATTRACTOR_RADIUS_M).raw())
             } else {
@@ -342,6 +353,13 @@ fn gathering(tick: u32, phase_ticks: u32) -> bool {
     (tick / phase_ticks) % 2 == 0
 }
 
+impl Herd {
+    /// Entities a client could plausibly be attached to.
+    fn residents(&self) -> &[u32] {
+        &self.residents
+    }
+}
+
 /// A coordinate in `lo..=hi`, raw.
 fn rng_in(rng: &mut Rng, lo: i32, hi: i32) -> i32 {
     lo + rng.below((hi - lo) as u32) as i32
@@ -416,8 +434,6 @@ impl Totals {
 /// How the population sits in cells, read through the snapshot a consumer can
 /// see. The checkpoint for movement: whether crowds form on their own.
 struct Occupancy {
-    occupied: usize,
-    cells: usize,
     max: usize,
     top_share: f64,
 }
@@ -429,12 +445,9 @@ fn occupancy(sim: &WorldSimulation<Herd>) -> Occupancy {
         .map(|i| snap.entities_for_cell(CellId::from_raw(i as u32)).len())
         .collect();
     let total: usize = counts.iter().sum();
-    let occupied = counts.iter().filter(|&&c| c > 0).count();
     counts.sort_unstable_by(|a, b| b.cmp(a));
     let top: usize = counts.iter().take(ATTRACTORS).sum();
     Occupancy {
-        occupied,
-        cells,
         max: counts.first().copied().unwrap_or(0),
         top_share: if total == 0 { 0.0 } else { top as f64 / total as f64 },
     }
@@ -445,6 +458,7 @@ fn main() {
     let mut wait = Wait::Sleep;
     let mut threads = None;
     let mut entities = ENTITIES;
+    let mut viewers = VIEWERS;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -452,11 +466,12 @@ fn main() {
             "--hold" => wait = Wait::Hold,
             "--threads" => threads = args.next().and_then(|n| n.parse().ok()),
             "--entities" => entities = args.next().and_then(|n| n.parse().ok()).unwrap_or(entities),
+            "--viewers" => viewers = args.next().and_then(|n| n.parse().ok()).unwrap_or(viewers),
             other => match other.parse() {
                 Ok(n) => ticks = n,
                 Err(_) => {
                     eprintln!(
-                        "usage: herd-sim [ticks] [--free-run|--hold] [--threads N] [--entities N]"
+                        "usage: herd-sim [ticks] [--free-run|--hold] [--threads N] [--entities N] [--viewers N]"
                     );
                     std::process::exit(2)
                 }
@@ -469,6 +484,15 @@ fn main() {
     let mut sim = WorldSimulation::new(cfg, Herd::new(&cfg, entities, SEED));
     if let Some(n) = threads {
         sim.set_thread_count(n);
+    }
+
+    // The first tick spawns, so there is nothing to attach a client to before
+    // it. Registration is logical: umwelt never sees a socket.
+    sim.tick();
+    let avatars: Vec<u32> = sim.game().residents().iter().copied().take(viewers).collect();
+    let registered = avatars.len();
+    for e in avatars {
+        sim.register_viewer(EntityId::from_raw(e), ClientLimits::default());
     }
 
     println!(
@@ -495,11 +519,15 @@ fn main() {
             ticks as f64 / cfg.tick_hz() as f64 / 60.0
         ),
     }
-    println!("No viewers are registered, so the replication columns are zero by construction.");
+    println!(
+        "{registered} clients, drawn from the entities that move and have a home, \
+         each declaring a {}-byte payload.",
+        ClientLimits::default().payload_bytes
+    );
     println!();
     println!(
-        "{:>6} {:>10} {:>9} {:>8} {:>10} {:>8}",
-        "tick", "phase", "occupied", "max cell", "top 8", "records"
+        "{:>6} {:>10} {:>9} {:>7} {:>7} {:>7} {:>8} {:>8}",
+        "tick", "phase", "max cell", "top 8", "cand", "rec", "work ms", "worst ms"
     );
 
     let period = std::time::Duration::from_nanos(1_000_000_000 / cfg.tick_hz() as u64);
@@ -507,6 +535,11 @@ fn main() {
     let mut work = Histogram::new();
     let mut late = Histogram::new();
     let mut over_budget = 0u64;
+    let mut over_half = 0u64;
+    let mut over_three_quarters = 0u64;
+    // Worst tick since the last report line, so a spike can be placed against
+    // the phase it happened in rather than only counted at the end.
+    let mut window_worst = std::time::Duration::ZERO;
 
     // umwelt owns the loop: it has the tick rate, so it keeps the schedule.
     let summary = sim.run(Pacing { wait, ticks: Some(ticks), ..Pacing::default() }, |r, sim| {
@@ -517,6 +550,13 @@ fn main() {
         if r.took > period {
             over_budget += 1;
         }
+        if r.took * 2 > period {
+            over_half += 1;
+        }
+        if r.took * 4 > period * 3 {
+            over_three_quarters += 1;
+        }
+        window_worst = window_worst.max(r.took);
         totals.add(&r.stats);
 
         if r.tick % report_every == 0 {
@@ -526,39 +566,56 @@ fn main() {
             } else {
                 "dispersing"
             };
+            let served = r.stats.viewers.max(1) as f64;
             println!(
-                "{:>6} {:>10} {:>4}/{:<4} {:>8} {:>9.1}% {:>8}",
+                "{:>6} {:>10} {:>9} {:>6.1}% {:>7.1} {:>7.1} {:>8.2} {:>8.2}",
                 r.tick,
                 phase,
-                o.occupied,
-                o.cells,
                 o.max,
                 100.0 * o.top_share,
-                r.stats.records
+                r.stats.candidates as f64 / served,
+                r.stats.records as f64 / served,
+                r.took.as_secs_f64() * 1000.0,
+                window_worst.as_secs_f64() * 1000.0
             );
+            window_worst = std::time::Duration::ZERO;
         }
         Flow::Continue
     });
 
     let budget_ms = period.as_secs_f64() * 1000.0;
     println!();
+    // Wall clock per tick is the period, not the work: a paced loop sleeps
+    // until it is. Only the work is measured against the budget.
+    match wait {
+        Wait::None => println!(
+            "{} ticks in {:.2} s, unpaced, so this is throughput and not a schedule",
+            summary.ticks,
+            summary.elapsed.as_secs_f64()
+        ),
+        _ => println!(
+            "{} ticks at {} Hz in {:.2} s, against a {:.2} s schedule plus the last tick's work",
+            summary.ticks,
+            cfg.tick_hz(),
+            summary.elapsed.as_secs_f64(),
+            period.as_secs_f64() * summary.ticks as f64
+        ),
+    }
     println!(
-        "{} ticks in {:.2} s, {:.2} ms per tick of wall clock against a {budget_ms:.0} ms budget",
-        summary.ticks,
-        summary.elapsed.as_secs_f64(),
-        summary.elapsed.as_secs_f64() * 1000.0 / summary.ticks.max(1) as f64
+        "tick work, which is what has to fit: p50 {:.2}, p90 {:.2}, p99 {:.2}, p99.9 {:.2}, worst {:.2} ms of a {budget_ms:.0} ms budget",
+        work.quantile_us(0.50) as f64 / 1000.0,
+        work.quantile_us(0.90) as f64 / 1000.0,
+        work.quantile_us(0.99) as f64 / 1000.0,
+        work.quantile_us(0.999) as f64 / 1000.0,
+        summary.worst_tick.as_secs_f64() * 1000.0
     );
     println!(
-        "tick work: p50 {:.2} ms, p99 {:.2} ms, worst {:.2} ms, {} of {} over budget",
-        work.quantile_us(0.50) as f64 / 1000.0,
-        work.quantile_us(0.99) as f64 / 1000.0,
-        summary.worst_tick.as_secs_f64() * 1000.0,
-        over_budget,
-        summary.ticks
+        "of {} ticks: {} over half the budget, {} over three quarters, {} over it",
+        summary.ticks, over_half, over_three_quarters, over_budget
     );
     if wait != Wait::None {
         println!(
-            "schedule: {} of {} ticks started late, p99 lateness {:.2} ms, worst {:.2} ms, {} deadlines dropped",
+            "schedule: {} of {} ticks started after their deadline, p99 lateness {:.2} ms, worst {:.2} ms, {} deadlines dropped",
             summary.late,
             summary.ticks,
             late.quantile_us(0.99) as f64 / 1000.0,
