@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/herd-mark-dark.svg">
+    <img src="assets/logo/herd-mark-light.svg" alt="herd" width="150">
+  </picture>
+</p>
+
 # herd
 
 A minimal game, used only to generate load for [umwelt](../umwelt-rs). Never
