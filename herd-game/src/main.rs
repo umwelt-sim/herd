@@ -1,11 +1,6 @@
-//! A game, on the other side of an edge.
-//!
-//! This is what a game developer writes: it holds no region connection, speaks
-//! no NATS, frames no messages, chooses no transports and polls nothing. It
-//! asks the edge for a population, walks it, and hands parts of it back as
-//! clients would come and go. What the edge says arrives as calls on a
-//! `ClientGame`, and whether a command rides a datagram or a reliable stream is
-//! a property of the command.
+//! Herd is an example of a game that could have been created by a game
+//! developer using the Umwelt library. It is designed as a smoke tester
+//! and load generator, not a playable thing.
 //!
 //! ```text
 //! cargo run --release -p herd-game
@@ -17,246 +12,79 @@
 //!
 //! `--clients` opens that many connections from this one process, each with its
 //! own population, which is how one machine stands in for a crowd.
+//!
+//! # Where things are
+//!
+//! - [`watcher`] is what the edge tells this game: umwelt calls it.
+//! - [`crowd`] is the game itself — entities, where they are, where they walk.
+//! - [`session`] is one connection and the loop that drives it.
+//!
+//! Nothing here frames a message, picks a transport, or polls for one.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+mod crowd;
+mod session;
+mod watcher;
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
 
-use umwelt::net::{ClientHandle, EdgeClient, EntityKind, RegionId};
-use umwelt::{ClientGame, EntityId, Fixed, PacketReader, Pos3};
+use umwelt::net::RegionId;
 
-/// Meters per second a walker covers. Well under the world's 40 m/s cap.
-const WALK_M_PER_SEC: i32 = 2;
-
-/// How far either side of home an entity walks before turning around.
-const RANGE_M: i32 = 32;
-
-/// What this game does with what its edge says.
-///
-/// The whole of a consumer's receive side: no polling, no timeout, and no
-/// decision about what silence means.
-struct Watcher {
-    spawned: Arc<Mutex<Vec<(u32, RegionId, EntityId)>>>,
-    removed: Arc<Mutex<Vec<u32>>>,
-    packets: Arc<AtomicU64>,
-    records: Arc<AtomicU64>,
-    gone: Arc<AtomicBool>,
+/// Everything the command line decides.
+pub struct Options {
+    /// Where the edge is listening.
+    pub addr: String,
+    /// Connections to open from this one process.
+    pub clients: usize,
+    /// Entities with a game client behind them. Each costs a viewer.
+    pub observers: usize,
+    /// Entities with nothing behind them: replicated to whoever can see them,
+    /// and sent nothing themselves.
+    pub unattended: usize,
+    /// Observers to hand back and replace each second, standing in for game
+    /// clients disconnecting and connecting.
+    pub churn: usize,
+    /// Which region this game puts its players in. Note that this doesn't
+    /// couple a game to a region. A real game would be aware of multiple
+    /// regions and be able to spawn in all of them.
+    pub region: RegionId,
+    /// How often this client sends. Its own business: a region's tick rate is
+    /// the region's, and a game is never told it. A real game might not have a
+    /// fixed send rate. This binary does because it's simulating player
+    /// interaction (for now).
+    pub send_hz: u32,
 }
 
-impl ClientGame for Watcher {
-    fn spawned(&mut self, handle: u32, region: RegionId, entity: EntityId) {
-        self.spawned.lock().expect("not poisoned").push((handle, region, entity));
+impl Options {
+    fn from_args() -> Options {
+        Options {
+            addr: herd_common::arg_or("edge", herd_common::DEFAULT_EDGE.to_string()),
+            clients: herd_common::arg_or("clients", 1usize),
+            observers: herd_common::arg_or("observers", 512usize),
+            unattended: herd_common::arg_or("unattended", 0usize),
+            churn: herd_common::arg_or("churn", 0usize),
+            region: RegionId::from_raw(herd_common::arg_or("region", 7u32)),
+            send_hz: herd_common::arg_or("send-hz", 20u32),
+        }
     }
-
-    fn removed(&mut self, handle: u32) {
-        self.removed.lock().expect("not poisoned").push(handle);
-    }
-
-    fn state(&mut self, _handle: u32, _region: RegionId, state: &PacketReader<'_>) {
-        self.packets.fetch_add(1, Ordering::Relaxed);
-        self.records.fetch_add(state.updates().count() as u64, Ordering::Relaxed);
-    }
-
-    fn disconnected(&mut self) {
-        self.gone.store(true, Ordering::Relaxed);
-    }
-}
-
-/// One entity this client asked for, named by the handle the edge gave back.
-struct Held {
-    handle: u32,
-    at: Pos3,
-    heading: i32,
-    /// The region's own id, once the edge has said what it is. Until then the
-    /// handle is the only name for it, which is the point of having one.
-    entity: Option<(RegionId, EntityId)>,
 }
 
 fn main() {
-    let addr: String = herd_common::arg_or("edge", herd_common::DEFAULT_EDGE.to_string());
-    let clients: usize = herd_common::arg_or("clients", 1usize);
-    let observers: usize = herd_common::arg_or("observers", 512usize);
-    let unattended: usize = herd_common::arg_or("unattended", 0usize);
-    let churn: usize = herd_common::arg_or("churn", 0usize);
-    // Which region this game puts its players in. The edge has no home and no
-    // opinion: the map of regions is the game's, kept out of band, so the
-    // client is what names one. See docs/adr/0003.
-    let region = RegionId::from_raw(herd_common::arg_or("region", 7u32));
-    // How often this client sends. Its own business: a region's tick rate is
-    // the region's, and a game is never told it.
-    let send_hz: u32 = herd_common::arg_or("send-hz", 20u32);
-
+    let options = Options::from_args();
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     let endpoint = herd_common::game_endpoint(runtime.handle());
     println!(
-        "herd-game: {clients} clients to {addr}, {observers} observers each in {region}"
+        "herd-game: {} clients to {}, {} observers each in {}",
+        options.clients, options.addr, options.observers, options.region
     );
 
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        for n in 0..clients {
+        for n in 0..options.clients {
             let endpoint = endpoint.clone();
             let runtime = runtime.handle().clone();
-            let addr = addr.clone();
+            let options = &options;
             let stop = &stop;
-            scope.spawn(move || {
-                play(
-                    &runtime, &endpoint, &addr, n, region, send_hz, observers, unattended,
-                    churn, stop,
-                )
-            });
+            scope.spawn(move || session::play(&runtime, &endpoint, options, n, stop));
         }
     });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn play(
-    runtime: &tokio::runtime::Handle,
-    endpoint: &quinn::Endpoint,
-    addr: &str,
-    n: usize,
-    region: RegionId,
-    send_hz: u32,
-    observers: usize,
-    unattended: usize,
-    churn: usize,
-    stop: &AtomicBool,
-) {
-    let target = addr.parse().unwrap_or_else(|e| {
-        eprintln!("--edge {addr:?}: {e}");
-        std::process::exit(1);
-    });
-    // This binary owns its connection, so where the edge is and what it has to
-    // present to be believed are decided here rather than by umwelt.
-    let conn = runtime
-        .block_on(async {
-            match endpoint.connect(target, "localhost") {
-                Ok(connecting) => connecting.await.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            }
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("connecting to {addr}: {e}");
-            std::process::exit(1);
-        });
-    // What the edge has said. One place, whichever transport carried it.
-    let spawned: Arc<Mutex<Vec<(u32, RegionId, EntityId)>>> = Arc::new(Mutex::new(Vec::new()));
-    let removed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-    let packets = Arc::new(AtomicU64::new(0));
-    let records = Arc::new(AtomicU64::new(0));
-    let gone = Arc::new(AtomicBool::new(false));
-    let watcher = Watcher {
-        spawned: Arc::clone(&spawned),
-        removed: Arc::clone(&removed),
-        packets: Arc::clone(&packets),
-        records: Arc::clone(&records),
-        gone: Arc::clone(&gone),
-    };
-    let client = EdgeClient::new(conn, runtime.clone(), |_handle| watcher).unwrap_or_else(|e| {
-        eprintln!("opening a stream: {e}");
-        std::process::exit(1);
-    });
-    let sending: ClientHandle = client.handle();
-
-    // A column of its own per client, so several do not stack on one spot.
-    let lane = ((std::process::id() as usize + n * 7) % 64) as i32 * 60 + 64;
-    let home = |k: usize| Pos3::from_meters(lane, 64 + (k as i32 % 3072), 0);
-
-    let mut held: Vec<Held> = Vec::new();
-    for k in 0..observers + unattended {
-        let kind = if k < observers { EntityKind::Observer } else { EntityKind::Unattended };
-        let at = home(k);
-        match sending.spawn(region, at, kind) {
-            Ok(handle) => held.push(Held { handle, at, heading: 1, entity: None }),
-            Err(e) => {
-                eprintln!("asking for an entity: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    {
-        let period = Duration::from_millis(1_000 / send_hz.max(1) as u64);
-        let step =
-            Fixed::from_raw(Fixed::from_meters(WALK_M_PER_SEC).raw() / send_hz.max(1) as i32);
-        let mut reported = Instant::now();
-        let mut sent = 0u64;
-        let mut given_back = 0u64;
-        let mut next_home = observers + unattended;
-
-        while !stop.load(Ordering::Relaxed) && !gone.load(Ordering::Relaxed) {
-            let deadline = Instant::now() + period;
-
-            for (handle, region, entity) in spawned.lock().expect("not poisoned").drain(..) {
-                if let Some(one) = held.iter_mut().find(|h| h.handle == handle) {
-                    one.entity = Some((region, entity));
-                }
-            }
-            // Anything the edge says is gone stops being moved, however it went
-            // — including a despawn this client never asked for.
-            for handle in removed.lock().expect("not poisoned").drain(..) {
-                held.retain(|h| h.handle != handle);
-            }
-
-            for one in held.iter_mut() {
-                let moved = Fixed::from_raw(one.at.x.raw() + step.raw() * one.heading);
-                if (moved.floor_meters() - lane).abs() > RANGE_M {
-                    one.heading = -one.heading;
-                } else {
-                    one.at.x = moved;
-                }
-            }
-            // A handle names an entity from the moment it is asked for, so a
-            // move can be sent before the region has answered.
-            let moves: Vec<(u32, Pos3)> = held.iter().map(|h| (h.handle, h.at)).collect();
-            if !moves.is_empty() {
-                if sending.move_entities(&moves).is_err() {
-                    return;
-                }
-                sent += moves.len() as u64;
-            }
-
-            if reported.elapsed() >= Duration::from_secs(1) {
-                if churn > 0 && held.len() >= churn {
-                    let leaving: Vec<u32> =
-                        held.iter().rev().take(churn).map(|h| h.handle).collect();
-                    for handle in &leaving {
-                        if sending.despawn(*handle).is_err() {
-                            return;
-                        }
-                    }
-                    given_back += leaving.len() as u64;
-                    // Replacements. The edge mints each handle, spent once and
-                    // never reused.
-                    for _ in 0..leaving.len() {
-                        let at = home(next_home);
-                        next_home += 1;
-                        match sending.spawn(region, at, EntityKind::Observer) {
-                            Ok(handle) => {
-                                held.push(Held { handle, at, heading: 1, entity: None })
-                            }
-                            Err(_) => return,
-                        }
-                    }
-                }
-
-                println!(
-                    "herd-game[{n}]: holding {} ({} with ids) | {sent} moves sent | \
-                     {} packets | {} records | {given_back} handed back",
-                    held.len(),
-                    held.iter().filter(|h| h.entity.is_some()).count(),
-                    packets.swap(0, Ordering::Relaxed),
-                    records.swap(0, Ordering::Relaxed),
-                );
-                reported = Instant::now();
-                sent = 0;
-            }
-
-            let now = Instant::now();
-            if now < deadline {
-                std::thread::sleep(deadline - now);
-            }
-        }
-    }
 }
