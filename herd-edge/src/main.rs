@@ -22,8 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{ClientId, EntityKey, EntityKind, RegionId};
-use umwelt::{EdgeGame, EdgeHandle, EdgeServer, EntityId, Fixed, Pos3};
+use umwelt::net::EntityKind;
+use umwelt::{
+    ClientId, EdgeGame, EdgeHandle, EdgeServer, EntityId, EntityKey, Fixed, Pos3, RegionId,
+};
 
 /// Meters per second a traveler covers, well under the world's 40 m/s cap.
 const WALK_M_PER_SEC: i32 = 2;

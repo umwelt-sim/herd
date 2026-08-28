@@ -38,10 +38,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use umwelt::net::{EdgeSink, Edges, Inbound, RegionId, RegionServer};
+use umwelt::net::{EdgeSink, Edges, Inbound, RegionServer};
 use umwelt::{
     CellId, DistSq, EntityId, Fixed, Flow, Game, Handoff, Pacing, PayloadSink, Pos2, Pos3,
-    Step, TickStats, Wait, WorldConfig, WorldSimulation,
+    RegionId, Step, TickStats, Wait, WorldConfig, WorldSimulation,
 };
 
 /// Clients watching the region, unless the command line says otherwise. The

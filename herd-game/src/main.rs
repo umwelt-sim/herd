@@ -27,7 +27,7 @@ mod watcher;
 
 use std::sync::atomic::AtomicBool;
 
-use umwelt::net::RegionId;
+use umwelt::RegionId;
 
 /// Everything the command line decides.
 pub struct Options {
@@ -47,8 +47,7 @@ pub struct Options {
     /// couple a game to a region. A real game would be aware of multiple
     /// regions and be able to spawn in all of them.
     pub region: RegionId,
-    /// How often this client sends. Its own business: a region's tick rate is
-    /// the region's, and a game is never told it. A real game might not have a
+    /// How often this client sends. A real game might not have a
     /// fixed send rate. This binary does because it's simulating player
     /// interaction (for now).
     pub send_hz: u32,

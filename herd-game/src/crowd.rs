@@ -8,8 +8,8 @@
 //! names one from the moment it is asked for, so this walks and moves entities
 //! before any region has said what id it gave them.
 
-use umwelt::net::{ClientHandle, EntityKind, NetError, RegionId};
-use umwelt::{EntityId, Fixed, Pos3};
+use umwelt::net::{ClientHandle, EntityKind, NetError};
+use umwelt::{EntityId, Fixed, Pos3, RegionId};
 
 use crate::watcher::Reports;
 

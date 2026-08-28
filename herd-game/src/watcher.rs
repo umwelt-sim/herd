@@ -10,8 +10,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use umwelt::net::RegionId;
-use umwelt::{ClientGame, EntityId, PacketReader};
+use umwelt::{ClientGame, EntityId, PacketReader, RegionId};
 
 /// What the edge has said, waiting for the loop in [`crate::session`].
 ///
