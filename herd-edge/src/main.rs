@@ -7,62 +7,29 @@
 //! connection without being decoded on the way through.
 //!
 //! ```text
-//! cargo run --release --example herd-edge
-//! cargo run --release --example herd-edge -- --edge 0.0.0.0:7777 --region 7
-//! cargo run --release --example herd-edge -- --to 8 --migrate 32
+//! cargo run --release -p herd-edge
+//! cargo run --release -p herd-edge -- --edge 0.0.0.0:7777
 //! ```
 //!
-//! Needs a `herd-sim` behind it, and `herd-game` in front. The third line needs
-//! a second `herd-sim --region 8` as well: it walks a herd of its own between
-//! the two regions by the sequence in `docs/adr/0003`, which is the whole of
-//! what ad hoc migration is — no message the protocol does not already have.
+//! Needs a `herd-sim` behind it and `herd-game` in front.
+//!
+//! It holds no entities of its own. An edge is a relay: what walks around a
+//! region belongs to a game, and migrating between two of them is a game's to
+//! perform — see `herd-game --to`. An edge that kept a herd would be a
+//! simulation living in the wrong tier.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use umwelt::net::EntityKind;
-use umwelt::{
-    ClientId, EdgeGame, EdgeHandle, EdgeServer, EntityId, EntityKey, Fixed, Pos3, RegionId,
-};
+use umwelt::{ClientId, EdgeGame, EdgeServer};
 
-/// Meters per second a traveler covers, well under the world's 40 m/s cap.
-const WALK_M_PER_SEC: i32 = 2;
-
-/// How far either side of its lane a traveler walks before turning around.
-const RANGE_M: i32 = 32;
-
-/// One entity this edge manages on nobody's behalf, and walks between regions.
-///
-/// Unattended rather than an observer: nothing is behind it, so a region sends
-/// it nothing and there is no client for the edge to route a packet to.
-struct Traveler {
-    region: RegionId,
-    at: Pos3,
-    heading: i32,
-}
-
-/// The herd this edge walks back and forth, and what is mid-transition.
-#[derive(Default)]
-struct Herd {
-    live: HashMap<EntityKey, Traveler>,
-    /// Asked for in a destination, with the origin's copy still there. The
-    /// wait belongs here rather than in the library: an add reaches an edge on
-    /// the same channel as payloads, so waiting inside a `migrate` call would
-    /// mean eating messages meant for its own loop. See `docs/adr/0003`.
-    in_transit: HashMap<EntityKey, EntityKey>,
-    migrated: u64,
-}
-
-/// What this edge does of its own accord.
+/// What this edge does of its own accord, which is almost nothing.
 ///
 /// Every callback below has a default that does nothing, and a game whose
-/// clients only spawn, move and despawn needs none of them. These are here
-/// because this edge keeps a herd of its own.
+/// clients only spawn, move and despawn implements none of them. These two are
+/// here to say who is connected.
 struct Game {
-    handle: EdgeHandle,
-    herd: Arc<Mutex<Herd>>,
     clients: Arc<Mutex<Vec<ClientId>>>,
 }
 
@@ -79,209 +46,56 @@ impl EdgeGame for Game {
         println!("herd-edge: {client} gone");
         self.clients.lock().expect("not poisoned").retain(|held| *held != client);
     }
-
-    fn spawned(
-        &mut self,
-        entity: EntityKey,
-        client: Option<ClientId>,
-        region: RegionId,
-        _id: EntityId,
-    ) {
-        if client.is_some() {
-            return; // A client's own. The library has already told it.
-        }
-        let mut herd = self.herd.lock().expect("not poisoned");
-        // Step three of docs/adr/0003: the destination has it, so the origin's
-        // copy can go back, and only now. Ordered the other way there is a
-        // window where the entity exists nowhere.
-        let Some(was) = herd.in_transit.remove(&entity) else {
-            // Not a migration, so this is one of the herd this edge asked for
-            // at startup and already recorded where it put it. Overwriting that
-            // would move it to the origin, which is nowhere near its lane.
-            return;
-        };
-        let at = herd.live.remove(&was).map(|t| t.at).unwrap_or_default();
-        herd.live.insert(entity, Traveler { region, at, heading: 1 });
-        herd.migrated += 1;
-        drop(herd);
-        let _ = self.handle.despawn(was);
-    }
-
-    fn removed(&mut self, entity: EntityKey, _client: Option<ClientId>) {
-        let mut herd = self.herd.lock().expect("not poisoned");
-        herd.live.remove(&entity);
-        herd.in_transit.remove(&entity);
-    }
 }
 
 fn main() {
     let url: String = herd_common::arg_or("nats", herd_common::DEFAULT_NATS.to_string());
     let listen: String = herd_common::arg_or("edge", herd_common::DEFAULT_EDGE.to_string());
-    let region = RegionId::from_raw(herd_common::arg_or("region", 7u32));
-    // Where travelers walk to, and back from. A second region, which has to be
-    // running: nothing here knows which regions exist, and a spawn sent to one
-    // that is not there is never answered.
-    let to: Option<RegionId> = herd_common::arg("to")
-        .map(|raw| RegionId::from_raw(raw.parse().unwrap_or_else(|_| {
-            eprintln!("--to: cannot read {raw:?}");
-            std::process::exit(2);
-        })));
-    // Entities of this edge's own to walk between the two regions.
-    let migrate: usize = herd_common::arg_or("migrate", 0usize);
-    if migrate > 0 && to.is_none() {
-        eprintln!("--migrate needs --to, which says where they are going");
-        std::process::exit(2);
-    }
 
     // This binary owns both ends. Where the broker is, what certificate the
     // edge presents, and which crypto provider is installed are all decided
     // here rather than by the library; see docs/adr/0006.
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-    let nats = runtime.block_on(herd_common::connect(&url, herd_common::arg("creds"))).unwrap_or_else(|e| {
-        eprintln!("nats {url}: {e}");
-        std::process::exit(1);
-    });
+    let nats = runtime
+        .block_on(herd_common::connect(&url, herd_common::arg("creds")))
+        .unwrap_or_else(|e| {
+            eprintln!("nats {url}: {e}");
+            std::process::exit(1);
+        });
     let quic = edge_endpoint(&listen, runtime.handle());
 
-    let herd_state = Arc::new(Mutex::new(Herd::default()));
     let clients = Arc::new(Mutex::new(Vec::new()));
     let server = {
-        let herd_state = Arc::clone(&herd_state);
         let clients = Arc::clone(&clients);
-        EdgeServer::new(nats, runtime.handle().clone(), quic, move |handle| Game {
-            handle,
-            herd: herd_state,
-            clients,
-        })
+        EdgeServer::new(nats, runtime.handle().clone(), quic, move |_handle| Game { clients })
     }
     .unwrap_or_else(|e| {
         eprintln!("starting the edge: {e}");
         std::process::exit(1);
     });
     server.set_heartbeat_interval(Duration::from_secs(herd_common::arg_or("heartbeat", 30u64)));
-
-    let handle = server.handle();
     println!("herd-edge: {} listening on {listen}", server.name());
 
-    // A lane of its own, well clear of where a game puts its clients, and
-    // inside the region: a position outside it is refused by the region and
-    // reported to nobody, which leaves the entity asked for and never answered.
-    let lane = 2048 + (std::process::id() % 30) as i32 * 60;
-    if let Some(other) = to {
-        println!("herd-edge: walking {migrate} of its own between {region} and {other}");
-        for k in 0..migrate {
-            let at = Pos3::from_meters(lane, 64 + (k as i32 % 3072), 0);
-            match handle.spawn_detached(region, at, EntityKind::Unattended) {
-                Ok(key) => {
-                    herd_state
-                        .lock()
-                        .expect("not poisoned")
-                        .live
-                        .insert(key, Traveler { region, at, heading: 1 });
-                }
-                Err(e) => {
-                    eprintln!("asking for a traveler: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-
     let stop = AtomicBool::new(false);
-    let period = Duration::from_millis(50);
-    let step = Fixed::from_raw(Fixed::from_meters(WALK_M_PER_SEC).raw() / 20);
     let mut reported = Instant::now();
-    let mut cursor = 0usize;
-
     while !stop.load(Ordering::Relaxed) {
-        let deadline = Instant::now() + period;
-
-        // Walk whatever this edge holds of its own.
-        {
-            let mut herd = herd_state.lock().expect("not poisoned");
-            let moves: Vec<(EntityKey, Pos3)> = herd
-                .live
-                .iter_mut()
-                .map(|(key, t)| {
-                    let moved = Fixed::from_raw(t.at.x.raw() + step.raw() * t.heading);
-                    if (moved.floor_meters() - lane).abs() > RANGE_M {
-                        t.heading = -t.heading;
-                    } else {
-                        t.at.x = moved;
-                    }
-                    (*key, t.at)
-                })
-                .collect();
-            drop(herd);
-            let _ = handle.move_entities(&moves);
+        std::thread::sleep(Duration::from_millis(100));
+        if reported.elapsed() < Duration::from_secs(1) {
+            continue;
         }
-
-        if reported.elapsed() >= Duration::from_secs(1) {
-            // Steps one and two of docs/adr/0003: ask the other region for it,
-            // at the position the game chose, and record that its origin copy
-            // is waiting on the answer. Step three happens in `spawned`.
-            //
-            // A cursor sweeping the herd rather than taking the front of it: an
-            // arrival goes in at whatever slot the map gives it, and taking a
-            // fixed prefix would walk the same few back and forth.
-            if let Some(other) = to {
-                let herd = herd_state.lock().expect("not poisoned");
-                let settled: Vec<(EntityKey, RegionId, Pos3)> = herd
-                    .live
-                    .iter()
-                    .filter(|(key, _)| !herd.in_transit.values().any(|was| was == *key))
-                    .map(|(key, t)| (*key, t.region, t.at))
-                    .collect();
-                if !settled.is_empty() {
-                    let take = migrate.min(settled.len()).div_ceil(4).max(1);
-                    let mut going = Vec::with_capacity(take);
-                    for k in 0..take {
-                        going.push(settled[(cursor + k) % settled.len()]);
-                    }
-                    cursor = (cursor + take) % settled.len();
-                    drop(herd);
-                    for (was, from, at) in going {
-                        // The same coordinates in the other region: both are
-                        // 4096 m, so a door is wherever the game says it is.
-                        let there = if from == region { other } else { region };
-                        if let Ok(key) =
-                            handle.spawn_detached(there, at, EntityKind::Unattended)
-                        {
-                            herd_state
-                                .lock()
-                                .expect("not poisoned")
-                                .in_transit
-                                .insert(key, was);
-                        }
-                    }
-                }
-            }
-
-            let stats = handle.stats();
-            let herd = herd_state.lock().expect("not poisoned");
-            let away = herd.live.values().filter(|t| t.region != region).count();
-            println!(
-                "herd-edge: {} clients | {} entities ({} observing) | \
-                 relayed {} undeliverable {} | commands {} refused {} | \
-                 herd {} ({away} away, {} in flight, {} migrated)",
-                stats.clients,
-                stats.entities,
-                stats.observers,
-                stats.relayed,
-                stats.undeliverable,
-                stats.commands,
-                stats.refused,
-                herd.live.len(),
-                herd.in_transit.len(),
-                herd.migrated,
-            );
-            reported = Instant::now();
-        }
-
-        let now = Instant::now();
-        if now < deadline {
-            std::thread::sleep(deadline - now);
-        }
+        let stats = server.stats();
+        println!(
+            "herd-edge: {} clients | {} entities ({} observing) | \
+             relayed {} undeliverable {} | commands {} refused {}",
+            stats.clients,
+            stats.entities,
+            stats.observers,
+            stats.relayed,
+            stats.undeliverable,
+            stats.commands,
+            stats.refused,
+        );
+        reported = Instant::now();
     }
 }
 

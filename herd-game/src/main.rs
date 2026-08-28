@@ -6,7 +6,13 @@
 //! cargo run --release -p herd-game
 //! cargo run --release -p herd-game -- --observers 512 --churn 8
 //! cargo run --release -p herd-game -- --clients 4 --observers 128
+//! cargo run --release -p herd-game -- --to 8 --migrate 32
 //! ```
+//!
+//! The last line needs a second `herd-sim --region 8` as well. It walks part of
+//! the crowd between the two regions by the sequence in `docs/adr/0003`, which
+//! is a game's to perform: umwelt does not know which regions exist, and the
+//! map of them is the game's, kept out of band.
 //!
 //! Needs a `herd-edge` listening, which needs a `herd-sim` behind it.
 //!
@@ -47,6 +53,12 @@ pub struct Options {
     /// couple a game to a region. A real game would be aware of multiple
     /// regions and be able to spawn in all of them.
     pub region: RegionId,
+    /// Another region to walk part of the crowd into, and back from. It has to
+    /// be running: a game keeps the map of regions, and umwelt does not know
+    /// which exist.
+    pub to: Option<RegionId>,
+    /// Entities to walk into the other region each second.
+    pub migrate: usize,
     /// How often this client sends. A real game might not have a
     /// fixed send rate. This binary does because it's simulating player
     /// interaction (for now).
@@ -62,6 +74,13 @@ impl Options {
             unattended: herd_common::arg_or("unattended", 0usize),
             churn: herd_common::arg_or("churn", 0usize),
             region: RegionId::from_raw(herd_common::arg_or("region", 7u32)),
+            to: herd_common::arg("to").map(|raw| {
+                RegionId::from_raw(raw.parse().unwrap_or_else(|_| {
+                    eprintln!("--to: cannot read {raw:?}");
+                    std::process::exit(2);
+                }))
+            }),
+            migrate: herd_common::arg_or("migrate", 0usize),
             send_hz: herd_common::arg_or("send-hz", 20u32),
         }
     }

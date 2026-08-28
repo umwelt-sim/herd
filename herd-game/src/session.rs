@@ -29,6 +29,7 @@ pub fn play(
     let mut crowd = Crowd::new(
         &sending,
         options.region,
+        options.to,
         lane,
         options.send_hz,
         options.observers,
@@ -58,10 +59,21 @@ pub fn play(
                 Ok(gone) => given_back += gone as u64,
                 Err(_) => return,
             }
+            if crowd.migrate(&sending, options.migrate).is_err() {
+                return;
+            }
             let (packets, records) = reports.take_traffic();
+            let travel = match options.to {
+                Some(other) => format!(
+                    " | {} migrated ({} in {other})",
+                    crowd.migrated,
+                    crowd.away(),
+                ),
+                None => String::new(),
+            };
             println!(
                 "herd-game[{n}]: holding {} ({} with ids) | {sent} moves sent | \
-                 {packets} packets | {records} records | {given_back} handed back",
+                 {packets} packets | {records} records | {given_back} handed back{travel}",
                 crowd.len(),
                 crowd.confirmed(),
             );
