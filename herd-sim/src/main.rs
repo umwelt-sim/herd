@@ -1,8 +1,10 @@
-//! The simulation binary.
+//! The region binary, and the first of herd's three peers.
 //!
-//! Owns a [`WorldSimulation`], supplies the game, and drives the tick loop.
-//! Nothing here opens a socket: payloads leave a simulation through a sink, and
-//! the sink that speaks to `herd-edge` is not built.
+//! Owns a [`WorldSimulation`], supplies the game, and drives the tick loop. It
+//! also serves a region: `herd-edge` reaches it over NATS, and everything an
+//! edge spawns lives alongside the population this game creates for itself.
+//! Payloads leave through an [`EdgeSink`], wrapped in a [`Handoff`] so the tick
+//! never waits on a broker.
 //!
 //! Step 2 of the build order. Entities walk to a destination and pick another
 //! on arrival.
@@ -33,9 +35,13 @@
 //! opaque payload a consumer would put its own fields in is not built. What
 //! reaches a client is the despawn.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use umwelt::net::{EdgeSink, Edges, Inbound, RegionId, RegionServer};
 use umwelt::{
-    CellId, ClientLimits, DistSq, EntityId, Fixed, Flow, Game, Pacing, Pos2, Pos3, Step, TickStats,
-    Wait, WorldConfig, WorldSimulation,
+    CellId, DistSq, EntityId, Fixed, Flow, Game, Handoff, Pacing, PayloadSink, Pos2, Pos3,
+    Step, TickStats, Wait, WorldConfig, WorldSimulation,
 };
 
 /// Clients watching the region, unless the command line says otherwise. The
@@ -56,6 +62,10 @@ const REPORTS: u32 = 20;
 
 /// Fixed, so a run reproduces.
 const SEED: u64 = 0x4845_5244;
+
+/// Ticks per second. All three peers build the same world from
+/// `herd_common::world`, so there is one spelling of it and they cannot drift.
+const TICK_HZ: u32 = 20;
 
 /// Meters held clear of the region edge, so a destination is always inside it.
 const MARGIN_M: i32 = 8;
@@ -242,7 +252,10 @@ impl Histogram {
         if self.count == 0 {
             return 0;
         }
-        let target = (self.count as f64 * q) as u64;
+        // Rounded up and never zero: truncating puts the target at 0 for a
+        // small count, and the first empty bucket then satisfies `acc >=
+        // target` and reports a microsecond for a tick that took a millisecond.
+        let target = ((self.count as f64 * q).ceil() as u64).max(1);
         let mut acc = 0;
         for (b, n) in self.buckets.iter().enumerate() {
             acc += n;
@@ -255,7 +268,12 @@ impl Histogram {
     }
 }
 
-/// xorshift64.
+/// xorshift64, hand-rolled rather than taken from `rand`.
+///
+/// A run reproduces from [`SEED`], and `rand` does not promise value stability
+/// across releases: an upgrade would silently change every figure this binary
+/// has ever reported. Ten lines that will never change are worth more here than
+/// a better generator, and nothing in a load generator needs one.
 struct Rng(u64);
 
 impl Rng {
@@ -287,6 +305,9 @@ impl Rng {
 /// Per-entity state is parallel to umwelt's position arrays and indexed by
 /// entity id, which spawn assigns in order and never reuses.
 struct Herd {
+    /// What the edges asked for. Applied inside the tick, which is the only
+    /// place an entity can be spawned, moved or despawned.
+    inbound: Arc<Inbound>,
     pending: Vec<Pos3>,
     attractors: Vec<Pos2>,
     /// Raw units per tick along each axis. Zero for a class that never moves.
@@ -309,6 +330,14 @@ struct Herd {
     /// The phase the current destination was chosen under, so a change of
     /// phase can be noticed by an entity that is still walking.
     phase_at: Vec<bool>,
+    /// Whether this game created the entity in this slot.
+    ///
+    /// An edge spawns into the same region, so slots arrive that this game
+    /// never chose a speed or a destination for. Those are left where their
+    /// edge puts them. They are still crowded and still hurt by it, because
+    /// standing in a crush is the region's business rather than whose entity
+    /// it is.
+    mine: Vec<bool>,
     /// Entities that both move and belong somewhere. Clients are drawn from
     /// these, so a viewer takes part in the cycle instead of watching it.
     residents: Vec<u32>,
@@ -350,7 +379,14 @@ struct Herd {
 }
 
 impl Herd {
-    fn new(cfg: &WorldConfig, n: usize, seed: u64, lifespan: u32, pattern: Pattern) -> Herd {
+    fn new(
+        cfg: &WorldConfig,
+        n: usize,
+        seed: u64,
+        lifespan: u32,
+        pattern: Pattern,
+        inbound: Arc<Inbound>,
+    ) -> Herd {
         let mut rng = Rng::new(seed);
         let lo = Fixed::from_meters(MARGIN_M).raw();
         let hi = cfg.region_size().raw() - lo;
@@ -370,6 +406,7 @@ impl Herd {
         }
 
         let mut herd = Herd {
+            inbound,
             pending: Vec::with_capacity(n),
             attractors,
             vel_x: vec![0; n],
@@ -378,6 +415,7 @@ impl Herd {
             dest: vec![Pos2::new(Fixed::ZERO, Fixed::ZERO); n],
             horizon: vec![0; n],
             wait: vec![0; n],
+            mine: vec![true; n],
             dwell: vec![0; n],
             home: vec![None; n],
             phase_at: vec![true; n],
@@ -607,6 +645,8 @@ impl Herd {
         let vertical = self.cfg.vertical_extent().raw() as u32;
         let z = Fixed::from_raw(self.rng.below(vertical) as i32);
 
+        self.adopt(i);
+        self.mine.push(true);
         self.vel_x.push(0);
         self.vel_y.push(0);
         self.speed.push(speed);
@@ -646,6 +686,15 @@ impl Game for Herd {
             return;
         }
 
+        // Everything the edges asked for, applied before this game's own
+        // movement so an entity spawned this tick is walked from where it was
+        // put. Ordered after the block above so the first tick's population
+        // still gets ids from zero.
+        self.inbound.apply(w);
+        // Those spawns appended slots this game has no state for. Give them
+        // inert state so every array stays parallel to umwelt's.
+        self.adopt(w.slots());
+
         // Slots are never reused, so this walks every entity that ever lived
         // and tests each. `LiveSet` has no iterator over the live ones, which
         // is the cost the design document's word-level skipping note is about,
@@ -661,7 +710,7 @@ impl Game for Herd {
             if !live.contains(EntityId::from_raw(i as u32)) {
                 continue;
             }
-            if self.speed[i] == 0 {
+            if !self.mine[i] || self.speed[i] == 0 {
                 continue;
             }
             // Flapping does not walk anywhere: it steps back and forth across
@@ -705,7 +754,10 @@ impl Game for Herd {
                 let jumps = xs.len() * TELEPORT_PER_MILLE / 1_000;
                 for _ in 0..jumps {
                     let i = self.rng.below(xs.len() as u32) as usize;
-                    if !live.contains(EntityId::from_raw(i as u32)) || self.speed[i] == 0 {
+                    if !live.contains(EntityId::from_raw(i as u32))
+                        || !self.mine[i]
+                        || self.speed[i] == 0
+                    {
                         continue;
                     }
                     xs[i] = Fixed::from_raw(rng_in(&mut self.rng, self.lo, self.hi));
@@ -715,6 +767,7 @@ impl Game for Herd {
             Pattern::Cull if tick % (CULL_PERIOD_S * self.tick_hz as u32) == 0 => {
                 for i in 0..xs.len() {
                     if live.contains(EntityId::from_raw(i as u32))
+                        && self.mine[i]
                         && self.rng.below(16) < CULL_IN_16
                     {
                         // Past anything regeneration can pull back: the health
@@ -766,6 +819,30 @@ impl Game for Herd {
     }
 }
 
+impl Herd {
+    /// Grows every per-entity array to cover `slots`.
+    ///
+    /// Slots this game did not create get state that leaves them alone: no
+    /// speed, no home, and no lifespan, so they die of crowding or not at all.
+    fn adopt(&mut self, slots: usize) {
+        if self.mine.len() >= slots {
+            return;
+        }
+        self.mine.resize(slots, false);
+        self.vel_x.resize(slots, 0);
+        self.vel_y.resize(slots, 0);
+        self.speed.resize(slots, 0);
+        self.dest.resize(slots, Pos2::new(Fixed::ZERO, Fixed::ZERO));
+        self.horizon.resize(slots, 0);
+        self.wait.resize(slots, 0);
+        self.dwell.resize(slots, 0);
+        self.home.resize(slots, None);
+        self.phase_at.resize(slots, false);
+        self.health.resize(slots, HEALTH_MAX);
+        self.dies_at.resize(slots, u32::MAX);
+    }
+}
+
 /// Which cell a position falls in, by umwelt's own arithmetic, flattened.
 fn cell_index(cfg: &WorldConfig, x: Fixed, y: Fixed, per_axis: usize) -> usize {
     let c = cfg.cell_of(Pos2::new(x, y));
@@ -800,7 +877,7 @@ struct Occupancy {
     max: usize,
 }
 
-fn occupancy(sim: &WorldSimulation<Herd>) -> Occupancy {
+fn occupancy<S: PayloadSink>(sim: &WorldSimulation<Herd, S>) -> Occupancy {
     let snap = sim.snapshot();
     let cells = snap.cell_count();
     let counts: Vec<usize> = (0..cells)
@@ -819,6 +896,10 @@ fn main() {
     let mut crowd = CROWD_THRESHOLD;
     let mut lifespan = LIFESPAN_S;
     let mut pattern = Pattern::Herd;
+    let mut nats = herd_common::DEFAULT_NATS.to_string();
+    let mut region = 7u32;
+    let mut heartbeat = 30u64;
+    let mut edge_timeout = 5u64;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -830,6 +911,16 @@ fn main() {
             "--damage" => damage = args.next().and_then(|n| n.parse().ok()).unwrap_or(damage),
             "--crowd" => crowd = args.next().and_then(|n| n.parse().ok()).unwrap_or(crowd),
             "--lifespan" => lifespan = args.next().and_then(|n| n.parse().ok()).unwrap_or(lifespan),
+            // Nothing here decides where the broker is or what the region is
+            // called: a deployment does, which is why they are arguments.
+            "--nats" => nats = args.next().unwrap_or(nats),
+            "--region" => region = args.next().and_then(|n| n.parse().ok()).unwrap_or(region),
+            "--heartbeat" => {
+                heartbeat = args.next().and_then(|n| n.parse().ok()).unwrap_or(heartbeat)
+            }
+            "--edge-timeout" => {
+                edge_timeout = args.next().and_then(|n| n.parse().ok()).unwrap_or(edge_timeout)
+            }
             "--pattern" => {
                 pattern = args.next().as_deref().and_then(Pattern::parse).unwrap_or_else(|| {
                     eprintln!("--pattern takes herd, flash, flap, thrash, teleport or cull");
@@ -840,7 +931,8 @@ fn main() {
                 Ok(n) => ticks = n,
                 Err(_) => {
                     eprintln!(
-                        "usage: herd-sim [ticks] [--free-run|--hold] [--threads N] [--entities N] [--viewers N]"
+                        "usage: herd-sim [ticks] [--free-run|--hold] [--threads N] \
+                         [--entities N] [--viewers N] [--nats URL] [--region N]"
                     );
                     std::process::exit(2)
                 }
@@ -849,11 +941,42 @@ fn main() {
     }
     let report_every = (ticks / REPORTS).max(1);
 
-    let cfg = WorldConfig::default();
-    let mut game = Herd::new(&cfg, entities, SEED, lifespan * cfg.tick_hz(), pattern);
+    let cfg = herd_common::world(TICK_HZ);
+    let region = RegionId::from_raw(region);
+
+    // This binary owns its connection, so the broker address, credentials and
+    // cluster membership are decided here rather than by umwelt.
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let client = runtime
+        .block_on(herd_common::connect(&nats, herd_common::arg("creds")))
+        .unwrap_or_else(|e| {
+            eprintln!("nats {nats}: {e}");
+            std::process::exit(1);
+        });
+    let edges = Arc::new(Edges::new());
+    let inbound = Arc::new(Inbound::new(Arc::clone(&edges)));
+    // Held for the whole run: dropping it stops serving.
+    let server = RegionServer::new(
+        client.clone(),
+        runtime.handle().clone(),
+        region,
+        cfg,
+        Arc::clone(&inbound),
+        Duration::from_secs(edge_timeout),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("serving {region}: {e}");
+        std::process::exit(1);
+    });
+    // Cadence is a deployment choice; the timer is umwelt's.
+    server.set_heartbeat_interval(Duration::from_secs(heartbeat));
+    let sink = EdgeSink::new(region, client, runtime.handle().clone(), Arc::clone(&edges));
+
+    let mut game =
+        Herd::new(&cfg, entities, SEED, lifespan * cfg.tick_hz(), pattern, Arc::clone(&inbound));
     game.damage_divisor = damage;
     game.crowd_threshold = crowd;
-    let mut sim = WorldSimulation::new(cfg, game);
+    let mut sim = WorldSimulation::new(cfg, game).with_sink(Handoff::new(sink.clone()));
     if let Some(n) = threads {
         sim.set_thread_count(n);
     }
@@ -864,9 +987,10 @@ fn main() {
     let avatars: Vec<u32> = sim.game().residents().iter().copied().take(viewers).collect();
     let registered = avatars.len();
     for e in avatars {
-        sim.register_viewer(EntityId::from_raw(e), ClientLimits::default());
+        sim.register_viewer(EntityId::from_raw(e), herd_common::limits());
     }
 
+    println!("herd-sim: serving {region} over {nats}");
     println!(
         "herd-sim: {pattern:?}, {entities} entities, {} m region, {} m cells, {} Hz, {} workers",
         cfg.region_size().floor_meters(),
@@ -894,12 +1018,13 @@ fn main() {
     println!(
         "{registered} clients, drawn from the entities that move and have a home, \
          each declaring a {}-byte payload.",
-        ClientLimits::default().payload_bytes
+        herd_common::PAYLOAD_BYTES
     );
     println!();
     println!(
-        "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>8}",
-        "tick", "phase", "max cell", "alive", "deaths", "cand", "rec", "dep", "desp", "work ms"
+        "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6}",
+        "tick", "phase", "max cell", "alive", "deaths", "cand", "rec", "dep", "desp",
+        "work ms", "edges"
     );
 
     let period = std::time::Duration::from_nanos(1_000_000_000 / cfg.tick_hz() as u64);
@@ -915,7 +1040,13 @@ fn main() {
     let mut peak_cell = 0usize;
 
     // umwelt owns the loop: it has the tick rate, so it keeps the schedule.
-    let summary = sim.run(Pacing { wait, ticks: Some(ticks), ..Pacing::default() }, |r, sim| {
+    // Zero runs until interrupted, which is what a region with edges attached
+    // wants; a fixed count is what a measurement run wants.
+    let limit = (ticks > 0).then_some(ticks);
+    let summary = sim.run(Pacing { wait, ticks: limit, ..Pacing::default() }, |r, sim| {
+        // Between ticks is the only place a viewer can be registered or
+        // dropped, which is why this is here and not in the game.
+        inbound.settle(sim, &sink, herd_common::limits());
         work.record(r.took.as_micros() as u64);
         if !r.late.is_zero() {
             late.record(r.late.as_micros() as u64);
@@ -942,7 +1073,7 @@ fn main() {
             peak_cell = peak_cell.max(o.max);
             let served = r.stats.viewers.max(1) as f64;
             println!(
-                "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7.1} {:>7.1} {:>7.2} {:>7.2} {:>8.2}",
+                "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7.1} {:>7.1} {:>7.2} {:>7.2} {:>8.2} {:>6}",
                 r.tick,
                 phase,
                 o.max,
@@ -952,7 +1083,8 @@ fn main() {
                 r.stats.records as f64 / served,
                 r.stats.departed as f64 / served,
                 r.stats.despawns_sent as f64 / served,
-                r.took.as_secs_f64() * 1000.0
+                r.took.as_secs_f64() * 1000.0,
+                edges.len(),
             );
             window_worst = std::time::Duration::ZERO;
         }
@@ -1026,4 +1158,92 @@ fn main() {
         "crowding: fullest cell peaked at {peak_cell} and ended at {}, against a threshold of {crowd}",
         occupancy(&sim).max
     );
+    println!(
+        "edges: {} attached, {} payloads delivered and {} dropped by the handoff, \
+         {} undeliverable, {} commands refused",
+        edges.len(),
+        sim.sink().delivered(),
+        sim.sink().dropped(),
+        sink.undeliverable(),
+        inbound.refused(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_world_alternates_between_gathering_and_dispersing() {
+        // Every entity sees the same phase at the same tick, which is what
+        // makes crowd sizes repeat from one cycle to the next.
+        assert!(gathering(0, 10));
+        assert!(gathering(9, 10));
+        assert!(!gathering(10, 10));
+        assert!(!gathering(19, 10));
+        assert!(gathering(20, 10));
+    }
+
+    #[test]
+    fn a_run_reproduces_from_its_seed() {
+        let draw = |seed| {
+            let mut rng = Rng::new(seed);
+            (0..64).map(|_| rng.next_u64()).collect::<Vec<_>>()
+        };
+        assert_eq!(draw(SEED), draw(SEED), "the same seed must replay a run");
+        assert_ne!(draw(SEED), draw(SEED + 2));
+    }
+
+    #[test]
+    fn an_even_seed_draws_the_same_run_as_the_odd_one_above_it() {
+        // `Rng::new` sets the low bit, because xorshift64 is stuck at zero and
+        // an all-even state would halve the period. The cost is that the seed
+        // space is halved too: 2n and 2n+1 are one stream. Harmless for a load
+        // generator, and worth knowing before anyone sweeps seeds by one.
+        let draw = |seed| {
+            let mut rng = Rng::new(seed);
+            (0..8).map(|_| rng.next_u64()).collect::<Vec<_>>()
+        };
+        assert_eq!(draw(2), draw(3));
+    }
+
+    #[test]
+    fn a_spread_stays_inside_its_bound() {
+        let mut rng = Rng::new(SEED);
+        for _ in 0..10_000 {
+            let n = rng.spread(64);
+            assert!((-64..=64).contains(&n), "{n} is outside the bound");
+        }
+    }
+
+    #[test]
+    fn a_histogram_reports_quantiles_in_order() {
+        let mut h = Histogram::new();
+        for us in 1..=1_000u64 {
+            h.record(us);
+        }
+        // Log-spaced buckets, so a quantile names the bucket it landed in
+        // rather than interpolating. What has to hold is the ordering and the
+        // scale, not an exact value.
+        let (p50, p90, p99) = (h.quantile_us(0.50), h.quantile_us(0.90), h.quantile_us(0.99));
+        assert!(p50 <= p90 && p90 <= p99, "quantiles came out {p50}, {p90}, {p99}");
+        assert!((256..=1_024).contains(&p50), "p50 came out at {p50}");
+        assert!((512..=1_024).contains(&p99), "p99 came out at {p99}");
+    }
+
+    #[test]
+    fn one_value_lands_within_a_quarter_octave_of_itself() {
+        let mut h = Histogram::new();
+        h.record(1_000);
+        let got = h.quantile_us(0.5);
+        assert!(
+            (840..=1_190).contains(&got),
+            "a single 1000 us tick reported as {got}, further than a bucket away"
+        );
+    }
+
+    #[test]
+    fn an_empty_histogram_has_no_quantile() {
+        assert_eq!(Histogram::new().quantile_us(0.5), 0);
+    }
 }

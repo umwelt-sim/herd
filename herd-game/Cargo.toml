@@ -1,5 +1,5 @@
 [package]
-name = "herd-edge"
+name = "herd-game"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,5 @@ publish.workspace = true
 [dependencies]
 umwelt.workspace = true
 herd-common.workspace = true
-async-nats.workspace = true
 tokio.workspace = true
 quinn.workspace = true
-rcgen.workspace = true

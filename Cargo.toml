@@ -1,5 +1,5 @@
 [workspace]
-members = ["herd-sim", "herd-edge"]
+members = ["herd-common", "herd-sim", "herd-edge", "herd-game"]
 resolver = "3"
 
 [workspace.package]
@@ -12,6 +12,12 @@ publish = false
 
 [workspace.dependencies]
 umwelt = { path = "../umwelt-rs" }
+herd-common = { path = "herd-common" }
+# Matching umwelt's own, so a path dependency does not pull two of anything.
+async-nats = "0.50"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [profile.dev]
 opt-level = 1
