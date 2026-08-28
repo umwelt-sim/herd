@@ -23,11 +23,13 @@
 //!
 //! - [`watcher`] is what the edge tells this game: umwelt calls it.
 //! - [`crowd`] is the game itself — entities, where they are, where they walk.
+//! - [`link`] is the four calls the crowd makes into umwelt.
 //! - [`session`] is one connection and the loop that drives it.
 //!
 //! Nothing here frames a message, picks a transport, or polls for one.
 
 mod crowd;
+mod link;
 mod session;
 mod watcher;
 

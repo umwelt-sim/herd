@@ -46,6 +46,18 @@ impl Reports {
         self.gone.load(Ordering::Relaxed)
     }
 
+    /// Records what a `Watcher` would have been told. For tests: the loop
+    /// reads a `Reports` and cannot tell who filled it in.
+    #[cfg(test)]
+    pub fn saw_spawned(&self, handle: u32, region: RegionId, entity: EntityId) {
+        self.spawned.lock().expect("not poisoned").push((handle, region, entity));
+    }
+
+    #[cfg(test)]
+    pub fn saw_removed(&self, handle: u32) {
+        self.removed.lock().expect("not poisoned").push(handle);
+    }
+
     pub fn watcher(&self) -> Watcher {
         Watcher { reports: self.clone() }
     }
