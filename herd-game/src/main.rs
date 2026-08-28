@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 
 use umwelt::net::{ClientHandle, EdgeClient, EntityKind, RegionId};
-use umwelt::{ClientGame, EntityId, Fixed, PacketReader, Pos3, RecordCodec, WorldConfig};
+use umwelt::{ClientGame, EntityId, Fixed, PacketReader, Pos3};
 
 /// Meters per second a walker covers. Well under the world's 40 m/s cap.
 const WALK_M_PER_SEC: i32 = 2;
@@ -42,7 +42,6 @@ struct Watcher {
     packets: Arc<AtomicU64>,
     records: Arc<AtomicU64>,
     gone: Arc<AtomicBool>,
-    codec: RecordCodec,
 }
 
 impl ClientGame for Watcher {
@@ -54,11 +53,9 @@ impl ClientGame for Watcher {
         self.removed.lock().expect("not poisoned").push(handle);
     }
 
-    fn state(&mut self, _region: RegionId, packet: &[u8]) {
+    fn state(&mut self, _handle: u32, _region: RegionId, state: &PacketReader<'_>) {
         self.packets.fetch_add(1, Ordering::Relaxed);
-        if let Some(reader) = PacketReader::new(&self.codec, packet) {
-            self.records.fetch_add(reader.updates().count() as u64, Ordering::Relaxed);
-        }
+        self.records.fetch_add(state.updates().count() as u64, Ordering::Relaxed);
     }
 
     fn disconnected(&mut self) {
@@ -86,7 +83,9 @@ fn main() {
     // opinion: the map of regions is the game's, kept out of band, so the
     // client is what names one. See docs/adr/0003.
     let region = RegionId::from_raw(herd_common::arg_or("region", 7u32));
-    let cfg = herd_common::world(herd_common::arg_or("hz", 20u32));
+    // How often this client sends. Its own business: a region's tick rate is
+    // the region's, and a game is never told it.
+    let send_hz: u32 = herd_common::arg_or("send-hz", 20u32);
 
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     let endpoint = herd_common::game_endpoint(runtime.handle());
@@ -103,7 +102,7 @@ fn main() {
             let stop = &stop;
             scope.spawn(move || {
                 play(
-                    &runtime, &endpoint, &addr, n, region, cfg, observers, unattended,
+                    &runtime, &endpoint, &addr, n, region, send_hz, observers, unattended,
                     churn, stop,
                 )
             });
@@ -118,7 +117,7 @@ fn play(
     addr: &str,
     n: usize,
     region: RegionId,
-    cfg: WorldConfig,
+    send_hz: u32,
     observers: usize,
     unattended: usize,
     churn: usize,
@@ -141,9 +140,6 @@ fn play(
             eprintln!("connecting to {addr}: {e}");
             std::process::exit(1);
         });
-    let codec = RecordCodec::new(&cfg);
-    let hz = cfg.tick_hz();
-
     // What the edge has said. One place, whichever transport carried it.
     let spawned: Arc<Mutex<Vec<(u32, RegionId, EntityId)>>> = Arc::new(Mutex::new(Vec::new()));
     let removed: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -156,7 +152,6 @@ fn play(
         packets: Arc::clone(&packets),
         records: Arc::clone(&records),
         gone: Arc::clone(&gone),
-        codec,
     };
     let client = EdgeClient::new(conn, runtime.clone(), |_handle| watcher).unwrap_or_else(|e| {
         eprintln!("opening a stream: {e}");
@@ -182,8 +177,9 @@ fn play(
     }
 
     {
-        let period = Duration::from_millis(1_000 / hz.max(1) as u64);
-        let step = Fixed::from_raw(Fixed::from_meters(WALK_M_PER_SEC).raw() / hz.max(1) as i32);
+        let period = Duration::from_millis(1_000 / send_hz.max(1) as u64);
+        let step =
+            Fixed::from_raw(Fixed::from_meters(WALK_M_PER_SEC).raw() / send_hz.max(1) as i32);
         let mut reported = Instant::now();
         let mut sent = 0u64;
         let mut given_back = 0u64;
