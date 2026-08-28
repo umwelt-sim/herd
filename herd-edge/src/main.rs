@@ -92,16 +92,17 @@ impl EdgeGame for Game {
         // Step three of docs/adr/0003: the destination has it, so the origin's
         // copy can go back, and only now. Ordered the other way there is a
         // window where the entity exists nowhere.
-        if let Some(was) = herd.in_transit.remove(&entity) {
-            let at = herd.live.remove(&was).map(|t| t.at).unwrap_or_default();
-            herd.live.insert(entity, Traveler { region, at, heading: 1 });
-            herd.migrated += 1;
-            drop(herd);
-            let _ = self.handle.despawn(was);
-        } else {
-            let at = Pos3::default();
-            herd.live.insert(entity, Traveler { region, at, heading: 1 });
-        }
+        let Some(was) = herd.in_transit.remove(&entity) else {
+            // Not a migration, so this is one of the herd this edge asked for
+            // at startup and already recorded where it put it. Overwriting that
+            // would move it to the origin, which is nowhere near its lane.
+            return;
+        };
+        let at = herd.live.remove(&was).map(|t| t.at).unwrap_or_default();
+        herd.live.insert(entity, Traveler { region, at, heading: 1 });
+        herd.migrated += 1;
+        drop(herd);
+        let _ = self.handle.despawn(was);
     }
 
     fn removed(&mut self, entity: EntityKey, _client: Option<ClientId>) {
