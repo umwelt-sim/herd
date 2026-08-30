@@ -1,0 +1,8 @@
+# Matching umwelt's, because herd is written against it and reads alongside it.
+# 90 rather than the 100 rustfmt defaults to, so hand-wrapped lines stay wrapped
+# where they were put.
+max_width = 90
+
+# Keep a single call, struct literal or array on one line up to the full width
+# rather than 60% of it, which is how the code is already written.
+use_small_heuristics = "Max"
