@@ -54,7 +54,7 @@ fn main() {
 
     // This binary owns both ends. Where the broker is, what certificate the
     // edge presents, and which crypto provider is installed are all decided
-    // here rather than by the library; see docs/adr/0006.
+    // here rather than by the library.
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     let nats = runtime
         .block_on(herd_common::connect(&options.nats, herd_common::arg("creds")))

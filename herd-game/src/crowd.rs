@@ -8,8 +8,7 @@
 //! names one from the moment it is asked for, so this walks and moves entities
 //! before any region has said what id it gave them.
 
-use umwelt::net::{EntityKind, NetError};
-use umwelt::{EntityId, Fixed, Pos3, RegionId};
+use umwelt::{EntityHandle, EntityId, EntityKind, Fixed, NetError, Pos3, RegionId};
 
 use crate::link::Link;
 use crate::watcher::Reports;
@@ -22,7 +21,7 @@ const RANGE_M: i32 = 32;
 
 /// One entity this game asked for.
 struct Held {
-    handle: u32,
+    handle: EntityHandle,
     /// Which region it was asked for in. A game is the only tier that sees more
     /// than one at a time, so keeping this is its job.
     region: RegionId,
@@ -126,7 +125,8 @@ impl Crowd {
                 one.at.x = moved;
             }
         }
-        let moves: Vec<(u32, Pos3)> = self.held.iter().map(|h| (h.handle, h.at)).collect();
+        let moves: Vec<(EntityHandle, Pos3)> =
+            self.held.iter().map(|h| (h.handle, h.at)).collect();
         if moves.is_empty() {
             return Ok(0);
         }
@@ -140,7 +140,8 @@ impl Crowd {
         if n == 0 || self.held.len() < n {
             return Ok(0);
         }
-        let leaving: Vec<u32> = self.held.iter().rev().take(n).map(|h| h.handle).collect();
+        let leaving: Vec<EntityHandle> =
+            self.held.iter().rev().take(n).map(|h| h.handle).collect();
         for handle in &leaving {
             sending.despawn(*handle)?;
         }
@@ -159,7 +160,7 @@ impl Crowd {
     ///
     /// The whole of ad hoc migration: ask the destination for it, and give the
     /// origin's copy back when the destination has it. `umwelt` does both
-    /// halves, so this only says which entity and where. See `docs/adr/0003`.
+    /// halves, so this only says which entity and where.
     pub fn migrate(&mut self, sending: &impl Link, n: usize) -> Result<(), NetError> {
         let Some(away) = self.away else { return Ok(()) };
         if n == 0 || self.held.is_empty() {
@@ -213,6 +214,11 @@ impl Crowd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shorthand, since every assertion in here names one.
+    fn h(raw: u32) -> EntityHandle {
+        EntityHandle::from_raw(raw)
+    }
     use crate::link::fake::{Fake, Said};
 
     const HOME: RegionId = RegionId::from_raw(7);
@@ -223,7 +229,7 @@ mod tests {
     }
 
     /// Everything the edge says about an entity, as a `Reports` would carry it.
-    fn confirm(crowd: &mut Crowd, handles: &[(u32, RegionId)]) {
+    fn confirm(crowd: &mut Crowd, handles: &[(EntityHandle, RegionId)]) {
         let reports = Reports::default();
         for (n, (handle, region)) in handles.iter().enumerate() {
             reports.saw_spawned(*handle, *region, EntityId::from_raw(n as u32));
@@ -273,7 +279,7 @@ mod tests {
         let link = Fake::new();
         let mut crowd = crowd(&link, 3, None);
         let reports = Reports::default();
-        reports.saw_removed(2);
+        reports.saw_removed(h(2));
         crowd.settle(&reports);
         assert_eq!(crowd.len(), 2, "a despawn nobody asked for still removes it");
     }
@@ -313,7 +319,8 @@ mod tests {
         // one of them, and the error stopped the client.
         let link = Fake::new();
         let mut crowd = crowd(&link, 8, Some(AWAY));
-        let handles: Vec<(u32, RegionId)> = (1..=8).map(|h| (h, HOME)).collect();
+        let handles: Vec<(EntityHandle, RegionId)> =
+            (1..=8).map(|h| (EntityHandle::from_raw(h), HOME)).collect();
         confirm(&mut crowd, &handles);
         for _ in 0..8 {
             crowd.churn(&link, 3).expect("churns");
@@ -325,7 +332,7 @@ mod tests {
     fn migration_walks_them_to_the_other_region_and_back() {
         let link = Fake::new();
         let mut crowd = crowd(&link, 2, Some(AWAY));
-        confirm(&mut crowd, &[(1, HOME), (2, HOME)]);
+        confirm(&mut crowd, &[(h(1), HOME), (h(2), HOME)]);
 
         crowd.migrate(&link, 2).expect("migrates");
         assert_eq!(crowd.migrated, 2);
@@ -341,7 +348,8 @@ mod tests {
         assert_eq!(went, vec![AWAY, AWAY]);
 
         // The handles changed, so the crowd has to be holding the new ones.
-        let now: Vec<(u32, RegionId)> = crowd.held.iter().map(|h| (h.handle, AWAY)).collect();
+        let now: Vec<(EntityHandle, RegionId)> =
+            crowd.held.iter().map(|h| (h.handle, AWAY)).collect();
         confirm(&mut crowd, &now);
         crowd.migrate(&link, 2).expect("migrates back");
         assert_eq!(crowd.away(), 0, "and home again");
@@ -353,7 +361,7 @@ mod tests {
         // migrate yet.
         let link = Fake::new();
         let mut crowd = crowd(&link, 4, Some(AWAY));
-        confirm(&mut crowd, &[(1, HOME), (2, HOME)]);
+        confirm(&mut crowd, &[(h(1), HOME), (h(2), HOME)]);
         crowd.migrate(&link, 4).expect("migrates");
         assert_eq!(crowd.migrated, 2, "only the two with ids");
     }
@@ -362,7 +370,7 @@ mod tests {
     fn a_crowd_told_of_nowhere_else_never_migrates() {
         let link = Fake::new();
         let mut crowd = crowd(&link, 4, None);
-        confirm(&mut crowd, &[(1, HOME), (2, HOME), (3, HOME), (4, HOME)]);
+        confirm(&mut crowd, &[(h(1), HOME), (h(2), HOME), (h(3), HOME), (h(4), HOME)]);
         crowd.migrate(&link, 4).expect("does nothing");
         assert_eq!(crowd.migrated, 0);
         assert_eq!(crowd.away(), 0);

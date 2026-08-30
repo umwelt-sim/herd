@@ -1,8 +1,7 @@
 //! The endpoint this edge listens on.
 //!
 //! umwelt takes a bound `quinn::Endpoint` and never touches certificates or the
-//! crypto provider, so both of those decisions are made here. See
-//! `docs/adr/0006`.
+//! crypto provider, so both of those decisions are made here.
 
 /// A listening endpoint with a certificate generated for this run.
 ///
@@ -30,8 +29,8 @@ pub fn endpoint(addr: &str, runtime: &tokio::runtime::Handle) -> quinn::Endpoint
             std::process::exit(1);
         });
     tls.alpn_protocols = vec![herd_common::ALPN.to_vec()];
-    let tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
-        .expect("a TLS 1.3 config");
+    let tls =
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("a TLS 1.3 config");
     let config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(tls));
 
     let addr: std::net::SocketAddr = addr.parse().unwrap_or_else(|e| {
@@ -64,7 +63,8 @@ mod tests {
 
         runtime.block_on(async move {
             let served = tokio::spawn(async move {
-                let conn = edge.accept().await.expect("a connection").await.expect("shakes");
+                let conn =
+                    edge.accept().await.expect("a connection").await.expect("shakes");
                 let (mut send, mut recv) = conn.accept_bi().await.expect("a stream");
                 let mut got = [0u8; 5];
                 recv.read_exact(&mut got).await.expect("five bytes");
@@ -75,8 +75,11 @@ mod tests {
                 got
             });
 
-            let conn =
-                game.connect(at, "localhost").expect("configured").await.expect("connects");
+            let conn = game
+                .connect(at, "localhost")
+                .expect("configured")
+                .await
+                .expect("connects");
             let (mut send, mut recv) = conn.open_bi().await.expect("a stream");
             send.write_all(b"herd!").await.expect("writes");
             let mut back = [0u8; 5];
@@ -97,11 +100,15 @@ mod tests {
 
         runtime.block_on(async move {
             let listening = tokio::spawn(async move {
-                let conn = edge.accept().await.expect("a connection").await.expect("shakes");
+                let conn =
+                    edge.accept().await.expect("a connection").await.expect("shakes");
                 conn.read_datagram().await.map(|d| d.len())
             });
-            let conn =
-                game.connect(at, "localhost").expect("configured").await.expect("connects");
+            let conn = game
+                .connect(at, "localhost")
+                .expect("configured")
+                .await
+                .expect("connects");
             let full = herd_common::PAYLOAD_BYTES as usize + 5;
             let room = conn.max_datagram_size().expect("datagrams are enabled");
             assert!(

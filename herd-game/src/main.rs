@@ -10,9 +10,9 @@
 //! ```
 //!
 //! The last line needs a second `herd-sim --region 8` as well. It walks part of
-//! the crowd between the two regions by the sequence in `docs/adr/0003`, which
-//! is a game's to perform: umwelt does not know which regions exist, and the
-//! map of them is the game's, kept out of band.
+//! the crowd between the two regions, which is a game's to perform: umwelt does
+//! not know which regions exist, and the map of them is the game's, kept out of
+//! band.
 //!
 //! Needs a `herd-edge` listening, which needs a `herd-sim` behind it.
 //!

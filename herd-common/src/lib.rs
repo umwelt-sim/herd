@@ -9,7 +9,7 @@ use std::str::FromStr;
 use umwelt::WorldConfig;
 
 /// Both ends reach each other through NATS rather than through each other, so
-/// this is the only address either needs. See `docs/adr/0001`.
+/// this is the only address either needs.
 pub const DEFAULT_NATS: &str = "nats://127.0.0.1:4222";
 
 /// Largest payload herd asks a region to build.
@@ -24,7 +24,10 @@ pub const PAYLOAD_BYTES: u16 = 1_100;
 
 /// What every herd client declares. See [`PAYLOAD_BYTES`].
 pub fn limits() -> umwelt::ClientLimits {
-    umwelt::ClientLimits { payload_bytes: PAYLOAD_BYTES, ..umwelt::ClientLimits::default() }
+    umwelt::ClientLimits {
+        payload_bytes: PAYLOAD_BYTES,
+        ..umwelt::ClientLimits::default()
+    }
 }
 
 /// `--name value`, anywhere in the arguments.
@@ -78,10 +81,8 @@ pub async fn connect(
         Some(path) => async_nats::ConnectOptions::with_credentials_file(path).await?,
         None => async_nats::ConnectOptions::new(),
     };
-    let servers: Vec<async_nats::ServerAddr> = url
-        .split(',')
-        .map(|one| one.trim().parse())
-        .collect::<Result<_, _>>()?;
+    let servers: Vec<async_nats::ServerAddr> =
+        url.split(',').map(|one| one.trim().parse()).collect::<Result<_, _>>()?;
     Ok(async_nats::connect_with_options(servers, options).await?)
 }
 
@@ -102,8 +103,7 @@ pub const ALPN: &[u8] = b"umwelt-herd";
 ///
 /// The library never does this. Installing a process-global default is a
 /// deployment's decision and a library has no business making it, which is why
-/// `EdgeServer::new` takes an endpoint that is already bound. See
-/// `docs/adr/0006`.
+/// `EdgeServer::new` takes an endpoint that is already bound.
 pub fn provider() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -129,12 +129,14 @@ pub fn game_endpoint(runtime: &tokio::runtime::Handle) -> quinn::Endpoint {
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("a TLS 1.3 config");
 
     let _guard = runtime.enter();
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("a valid address"))
-        .unwrap_or_else(|e| {
-            eprintln!("binding a client socket: {e}");
-            std::process::exit(1);
-        });
-    endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(tls)));
+    let mut endpoint =
+        quinn::Endpoint::client("0.0.0.0:0".parse().expect("a valid address"))
+            .unwrap_or_else(|e| {
+                eprintln!("binding a client socket: {e}");
+                std::process::exit(1);
+            });
+    endpoint
+        .set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(tls)));
     endpoint
 }
 
@@ -150,10 +152,8 @@ impl quinn::rustls::client::danger::ServerCertVerifier for TrustAnything {
         _server_name: &quinn::rustls::pki_types::ServerName<'_>,
         _ocsp: &[u8],
         _now: quinn::rustls::pki_types::UnixTime,
-    ) -> Result<
-        quinn::rustls::client::danger::ServerCertVerified,
-        quinn::rustls::Error,
-    > {
+    ) -> Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error>
+    {
         Ok(quinn::rustls::client::danger::ServerCertVerified::assertion())
     }
 

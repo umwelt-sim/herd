@@ -40,8 +40,8 @@ use std::time::Duration;
 
 use umwelt::net::{EdgeSink, Edges, Inbound, RegionServer};
 use umwelt::{
-    DistSq, EntityId, Fixed, Flow, Game, Handoff, Pacing, PayloadSink, Pos2, Pos3, RegionId, Step,
-    TickStats, Wait, WorldConfig, WorldSimulation,
+    DistSq, EntityId, Fixed, Flow, Game, Handoff, Pacing, PayloadSink, Pos2, Pos3,
+    RegionId, Step, TickStats, Wait, WorldConfig, WorldSimulation,
 };
 
 /// Clients watching the region, unless the command line says otherwise. The
@@ -217,13 +217,8 @@ const MAX_SPAWNS_PER_TICK: usize = 64;
 /// Motion classes as (share in percent, meters per second, and thousandths).
 /// Carried over from umwelt's quality harness, where the mix is **chosen rather
 /// than measured against any real game**.
-const MIX: [(u32, i32, i32); 5] = [
-    (35, 0, 0),
-    (25, 0, 200),
-    (25, 1, 500),
-    (10, 6, 0),
-    (5, 30, 0),
-];
+const MIX: [(u32, i32, i32); 5] =
+    [(35, 0, 0), (25, 0, 200), (25, 1, 500), (10, 6, 0), (5, 30, 0)];
 
 /// Tick durations, in quarter-octave buckets on microseconds, so a percentile
 /// is not pinned to a power of two.
@@ -235,11 +230,7 @@ struct Histogram {
 
 impl Histogram {
     fn new() -> Histogram {
-        Histogram {
-            buckets: [0; 128],
-            count: 0,
-            max_us: 0,
-        }
+        Histogram { buckets: [0; 128], count: 0, max_us: 0 }
     }
 
     fn record(&mut self, us: u64) {
@@ -270,11 +261,7 @@ impl Histogram {
             acc += n;
             if acc >= target {
                 let (oct, sub) = (b as u32 / 4, b as u32 % 4);
-                return if oct < 2 {
-                    1 << oct
-                } else {
-                    ((4 + sub) as u64) << (oct - 2)
-                };
+                return if oct < 2 { 1 << oct } else { ((4 + sub) as u64) << (oct - 2) };
             }
         }
         self.max_us
@@ -462,7 +449,9 @@ impl Herd {
             let (_, m, milli) = MIX[class];
             herd.speed[i] = match pattern {
                 Pattern::Flap if m > 0 || milli > 0 => Fixed::from_meters(FLAP_M).raw(),
-                Pattern::Flash if m > 0 || milli > 0 => Fixed::from_meters(FLASH_SPEED).raw() / hz,
+                Pattern::Flash if m > 0 || milli > 0 => {
+                    Fixed::from_meters(FLASH_SPEED).raw() / hz
+                }
                 Pattern::Thrash if m > 0 || milli > 0 => {
                     Fixed::from_meters(THRASH_SPEED).raw() / hz
                 }
@@ -473,7 +462,8 @@ impl Herd {
             // Every pattern but the plausible one needs viewers to draw from,
             // and draws them from whatever moves.
             let resident = herd.speed[i] > 0
-                && (pattern != Pattern::Herd || herd.rng.below(16) < SPAWN_AT_ATTRACTOR_IN_16);
+                && (pattern != Pattern::Herd
+                    || herd.rng.below(16) < SPAWN_AT_ATTRACTOR_IN_16);
             let at = if resident {
                 let h = herd.rng.below(ATTRACTORS as u32) as u8;
                 herd.home[i] = Some(h);
@@ -553,7 +543,8 @@ impl Herd {
                     near[self.rng.below(near.len() as u32) as usize]
                 };
                 let (lo, hi) = DWELL_S;
-                self.dwell[i] = (lo * hz + self.rng.below(((hi - lo) * hz) as u32) as i32) as u32;
+                self.dwell[i] =
+                    (lo * hz + self.rng.below(((hi - lo) * hz) as u32) as i32) as u32;
                 self.offset(a, Fixed::from_meters(ATTRACTOR_RADIUS_M).raw())
             }
             None => {
@@ -673,24 +664,18 @@ impl Herd {
         self.vel_y.push(0);
         self.speed.push(speed);
         self.dest.push(at);
-        self.horizon
-            .push(speed.saturating_mul(HORIZON_S * self.tick_hz));
+        self.horizon.push(speed.saturating_mul(HORIZON_S * self.tick_hz));
         self.wait.push(0);
         self.dwell.push(0);
         self.home.push(home);
         self.phase_at.push(gathering);
         self.health.push(HEALTH_MAX);
-        let dies_at = w
-            .tick()
-            .wrapping_add(self.lifespan / 2 + 1 + self.rng.below(self.lifespan));
+        let dies_at =
+            w.tick().wrapping_add(self.lifespan / 2 + 1 + self.rng.below(self.lifespan));
         self.dies_at.push(dies_at);
 
         let id = w.spawn(at.at_height(z));
-        assert_eq!(
-            id.index(),
-            i,
-            "spawn appends, so the game's arrays stay parallel"
-        );
+        assert_eq!(id.index(), i, "spawn appends, so the game's arrays stay parallel");
         if home.is_some() {
             self.residents.push(i as u32);
         }
@@ -742,11 +727,7 @@ impl Game for Herd {
             // Flapping does not walk anywhere: it steps back and forth across
             // the boundary it was placed on, one crossing a tick.
             if self.pattern == Pattern::Flap {
-                let step = if self.phase_at[i] {
-                    self.speed[i]
-                } else {
-                    -self.speed[i]
-                };
+                let step = if self.phase_at[i] { self.speed[i] } else { -self.speed[i] };
                 self.phase_at[i] = !self.phase_at[i];
                 xs[i] = Fixed::from_raw(xs[i].raw() + step);
                 continue;
@@ -914,9 +895,7 @@ struct Occupancy {
 
 fn occupancy<S: PayloadSink>(sim: &WorldSimulation<Herd, S>) -> Occupancy {
     let counts = &sim.game().occupancy;
-    Occupancy {
-        max: counts.iter().copied().max().unwrap_or(0) as usize,
-    }
+    Occupancy { max: counts.iter().copied().max().unwrap_or(0) as usize }
 }
 
 fn main() {
@@ -939,34 +918,40 @@ fn main() {
             "--free-run" => wait = Wait::None,
             "--hold" => wait = Wait::Hold,
             "--threads" => threads = args.next().and_then(|n| n.parse().ok()),
-            "--entities" => entities = args.next().and_then(|n| n.parse().ok()).unwrap_or(entities),
-            "--viewers" => viewers = args.next().and_then(|n| n.parse().ok()).unwrap_or(viewers),
-            "--damage" => damage = args.next().and_then(|n| n.parse().ok()).unwrap_or(damage),
-            "--crowd" => crowd = args.next().and_then(|n| n.parse().ok()).unwrap_or(crowd),
-            "--lifespan" => lifespan = args.next().and_then(|n| n.parse().ok()).unwrap_or(lifespan),
+            "--entities" => {
+                entities = args.next().and_then(|n| n.parse().ok()).unwrap_or(entities)
+            }
+            "--viewers" => {
+                viewers = args.next().and_then(|n| n.parse().ok()).unwrap_or(viewers)
+            }
+            "--damage" => {
+                damage = args.next().and_then(|n| n.parse().ok()).unwrap_or(damage)
+            }
+            "--crowd" => {
+                crowd = args.next().and_then(|n| n.parse().ok()).unwrap_or(crowd)
+            }
+            "--lifespan" => {
+                lifespan = args.next().and_then(|n| n.parse().ok()).unwrap_or(lifespan)
+            }
             // Nothing here decides where the broker is or what the region is
             // called: a deployment does, which is why they are arguments.
             "--nats" => nats = args.next().unwrap_or(nats),
-            "--region" => region = args.next().and_then(|n| n.parse().ok()).unwrap_or(region),
+            "--region" => {
+                region = args.next().and_then(|n| n.parse().ok()).unwrap_or(region)
+            }
             "--heartbeat" => {
-                heartbeat = args
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(heartbeat)
+                heartbeat = args.next().and_then(|n| n.parse().ok()).unwrap_or(heartbeat)
             }
             "--edge-timeout" => {
-                edge_timeout = args
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(edge_timeout)
+                edge_timeout =
+                    args.next().and_then(|n| n.parse().ok()).unwrap_or(edge_timeout)
             }
             "--pattern" => {
-                pattern = args
-                    .next()
-                    .as_deref()
-                    .and_then(Pattern::parse)
-                    .unwrap_or_else(|| {
-                        eprintln!("--pattern takes herd, flash, flap, thrash, teleport or cull");
+                pattern =
+                    args.next().as_deref().and_then(Pattern::parse).unwrap_or_else(|| {
+                        eprintln!(
+                            "--pattern takes herd, flash, flap, thrash, teleport or cull"
+                        );
                         std::process::exit(2)
                     })
             }
@@ -1013,7 +998,8 @@ fn main() {
     });
     // Cadence is a deployment choice; the timer is umwelt's.
     server.set_heartbeat_interval(Duration::from_secs(heartbeat));
-    let sink = EdgeSink::new(region, client, runtime.handle().clone(), Arc::clone(&edges));
+    let sink =
+        EdgeSink::new(region, client, runtime.handle().clone(), Arc::clone(&edges));
 
     let mut game = Herd::new(
         &cfg,
@@ -1033,13 +1019,8 @@ fn main() {
     // The first tick spawns, so there is nothing to attach a client to before
     // it. Registration is logical: umwelt never sees a socket.
     sim.tick();
-    let avatars: Vec<u32> = sim
-        .game()
-        .residents()
-        .iter()
-        .copied()
-        .take(viewers)
-        .collect();
+    let avatars: Vec<u32> =
+        sim.game().residents().iter().copied().take(viewers).collect();
     let registered = avatars.len();
     for e in avatars {
         sim.register_viewer(EntityId::from_raw(e), herd_common::limits());
@@ -1065,11 +1046,7 @@ fn main() {
         w => println!(
             "Clocked at {} Hz by umwelt, {}: {} ticks is {:.1} minutes of wall clock.",
             cfg.tick_hz(),
-            if w == Wait::Hold {
-                "holding the core"
-            } else {
-                "sleeping to the deadline"
-            },
+            if w == Wait::Hold { "holding the core" } else { "sleeping to the deadline" },
             ticks,
             ticks as f64 / cfg.tick_hz() as f64 / 60.0
         ),
@@ -1300,15 +1277,9 @@ mod tests {
         // Log-spaced buckets, so a quantile names the bucket it landed in
         // rather than interpolating. What has to hold is the ordering and the
         // scale, not an exact value.
-        let (p50, p90, p99) = (
-            h.quantile_us(0.50),
-            h.quantile_us(0.90),
-            h.quantile_us(0.99),
-        );
-        assert!(
-            p50 <= p90 && p90 <= p99,
-            "quantiles came out {p50}, {p90}, {p99}"
-        );
+        let (p50, p90, p99) =
+            (h.quantile_us(0.50), h.quantile_us(0.90), h.quantile_us(0.99));
+        assert!(p50 <= p90 && p90 <= p99, "quantiles came out {p50}, {p90}, {p99}");
         assert!((256..=1_024).contains(&p50), "p50 came out at {p50}");
         assert!((512..=1_024).contains(&p99), "p99 came out at {p99}");
     }

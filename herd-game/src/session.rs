@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use umwelt::net::{ClientHandle, EdgeClient};
+use umwelt::{ClientHandle, EdgeClient};
 
 use crate::Options;
 use crate::crowd::Crowd;

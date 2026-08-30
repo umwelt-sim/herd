@@ -38,10 +38,7 @@ impl Reports {
 
     /// Packets and records since this was last asked.
     pub fn take_traffic(&self) -> (u64, u64) {
-        (
-            self.packets.swap(0, Ordering::Relaxed),
-            self.records.swap(0, Ordering::Relaxed),
-        )
+        (self.packets.swap(0, Ordering::Relaxed), self.records.swap(0, Ordering::Relaxed))
     }
 
     /// Whether the connection has gone.
@@ -53,10 +50,7 @@ impl Reports {
     /// reads a `Reports` and cannot tell who filled it in.
     #[cfg(test)]
     pub fn saw_spawned(&self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-        self.spawned
-            .lock()
-            .expect("not poisoned")
-            .push((handle, region, entity));
+        self.spawned.lock().expect("not poisoned").push((handle, region, entity));
     }
 
     #[cfg(test)]
@@ -65,9 +59,7 @@ impl Reports {
     }
 
     pub fn watcher(&self) -> Watcher {
-        Watcher {
-            reports: self.clone(),
-        }
+        Watcher { reports: self.clone() }
     }
 }
 
@@ -78,19 +70,11 @@ pub struct Watcher {
 
 impl ClientGame for Watcher {
     fn spawned(&mut self, handle: EntityHandle, region: RegionId, entity: EntityId) {
-        self.reports
-            .spawned
-            .lock()
-            .expect("not poisoned")
-            .push((handle, region, entity));
+        self.reports.spawned.lock().expect("not poisoned").push((handle, region, entity));
     }
 
     fn removed(&mut self, handle: EntityHandle) {
-        self.reports
-            .removed
-            .lock()
-            .expect("not poisoned")
-            .push(handle);
+        self.reports.removed.lock().expect("not poisoned").push(handle);
     }
 
     fn observed(
