@@ -40,8 +40,8 @@ use std::time::Duration;
 
 use umwelt::net::{EdgeSink, Edges, Inbound, RegionServer};
 use umwelt::{
-    CellId, DistSq, EntityId, Fixed, Flow, Game, Handoff, Pacing, PayloadSink, Pos2, Pos3,
-    RegionId, Step, TickStats, Wait, WorldConfig, WorldSimulation,
+    DistSq, EntityId, Fixed, Flow, Game, Handoff, Pacing, PayloadSink, Pos2, Pos3, RegionId, Step,
+    TickStats, Wait, WorldConfig, WorldSimulation,
 };
 
 /// Clients watching the region, unless the command line says otherwise. The
@@ -217,8 +217,13 @@ const MAX_SPAWNS_PER_TICK: usize = 64;
 /// Motion classes as (share in percent, meters per second, and thousandths).
 /// Carried over from umwelt's quality harness, where the mix is **chosen rather
 /// than measured against any real game**.
-const MIX: [(u32, i32, i32); 5] =
-    [(35, 0, 0), (25, 0, 200), (25, 1, 500), (10, 6, 0), (5, 30, 0)];
+const MIX: [(u32, i32, i32); 5] = [
+    (35, 0, 0),
+    (25, 0, 200),
+    (25, 1, 500),
+    (10, 6, 0),
+    (5, 30, 0),
+];
 
 /// Tick durations, in quarter-octave buckets on microseconds, so a percentile
 /// is not pinned to a power of two.
@@ -230,7 +235,11 @@ struct Histogram {
 
 impl Histogram {
     fn new() -> Histogram {
-        Histogram { buckets: [0; 128], count: 0, max_us: 0 }
+        Histogram {
+            buckets: [0; 128],
+            count: 0,
+            max_us: 0,
+        }
     }
 
     fn record(&mut self, us: u64) {
@@ -261,7 +270,11 @@ impl Histogram {
             acc += n;
             if acc >= target {
                 let (oct, sub) = (b as u32 / 4, b as u32 % 4);
-                return if oct < 2 { 1 << oct } else { ((4 + sub) as u64) << (oct - 2) };
+                return if oct < 2 {
+                    1 << oct
+                } else {
+                    ((4 + sub) as u64) << (oct - 2)
+                };
             }
         }
         self.max_us
@@ -394,7 +407,12 @@ impl Herd {
         let hz = cfg.tick_hz() as i32;
 
         let attractors = (0..ATTRACTORS)
-            .map(|_| Pos2::new(Fixed::from_raw(rng_in(&mut rng, lo, hi)), Fixed::from_raw(rng_in(&mut rng, lo, hi))))
+            .map(|_| {
+                Pos2::new(
+                    Fixed::from_raw(rng_in(&mut rng, lo, hi)),
+                    Fixed::from_raw(rng_in(&mut rng, lo, hi)),
+                )
+            })
             .collect();
 
         // Cumulative shares, so one draw picks a class.
@@ -444,9 +462,7 @@ impl Herd {
             let (_, m, milli) = MIX[class];
             herd.speed[i] = match pattern {
                 Pattern::Flap if m > 0 || milli > 0 => Fixed::from_meters(FLAP_M).raw(),
-                Pattern::Flash if m > 0 || milli > 0 => {
-                    Fixed::from_meters(FLASH_SPEED).raw() / hz
-                }
+                Pattern::Flash if m > 0 || milli > 0 => Fixed::from_meters(FLASH_SPEED).raw() / hz,
                 Pattern::Thrash if m > 0 || milli > 0 => {
                     Fixed::from_meters(THRASH_SPEED).raw() / hz
                 }
@@ -480,7 +496,8 @@ impl Herd {
             } else {
                 at
             };
-            herd.pending.push(at.at_height(Fixed::from_raw(herd.rng.below(vertical) as i32)));
+            herd.pending
+                .push(at.at_height(Fixed::from_raw(herd.rng.below(vertical) as i32)));
             let dies_at = 1 + herd.rng.below(herd.lifespan);
             herd.dies_at.push(dies_at);
             herd.retarget(i, at, true);
@@ -508,7 +525,8 @@ impl Herd {
                 let a = self.attractors[h as usize];
                 if gathering {
                     let (lo, hi) = DWELL_S;
-                    self.dwell[i] = (lo * hz + self.rng.below(((hi - lo) * hz) as u32) as i32) as u32;
+                    self.dwell[i] =
+                        (lo * hz + self.rng.below(((hi - lo) * hz) as u32) as i32) as u32;
                     self.offset(a, Fixed::from_meters(ATTRACTOR_RADIUS_M).raw())
                 } else {
                     self.dwell[i] = 0;
@@ -519,8 +537,12 @@ impl Herd {
             // visits whichever attractor it can reach.
             None if self.rng.below(16) < ATTRACT_IN_16 => {
                 let reach = DistSq::from_radius(Fixed::from_raw(self.horizon[i]));
-                let near: Vec<Pos2> =
-                    self.attractors.iter().copied().filter(|a| at.dist_sq(*a) <= reach).collect();
+                let near: Vec<Pos2> = self
+                    .attractors
+                    .iter()
+                    .copied()
+                    .filter(|a| at.dist_sq(*a) <= reach)
+                    .collect();
                 let a = if near.is_empty() {
                     *self
                         .attractors
@@ -614,7 +636,7 @@ impl Herd {
     /// array the game keeps beside umwelt's own, and a long run grows all of
     /// them for as long as anything dies.
     fn spawn_one(&mut self, w: &mut Step<'_>, gathering: bool) {
-        let i = w.slots();
+        let i = w.id_space();
         let (m, milli) = {
             let roll = self.rng.below(100);
             let mut acc = 0;
@@ -651,18 +673,24 @@ impl Herd {
         self.vel_y.push(0);
         self.speed.push(speed);
         self.dest.push(at);
-        self.horizon.push(speed.saturating_mul(HORIZON_S * self.tick_hz));
+        self.horizon
+            .push(speed.saturating_mul(HORIZON_S * self.tick_hz));
         self.wait.push(0);
         self.dwell.push(0);
         self.home.push(home);
         self.phase_at.push(gathering);
         self.health.push(HEALTH_MAX);
-        let dies_at =
-            w.tick().wrapping_add(self.lifespan / 2 + 1 + self.rng.below(self.lifespan));
+        let dies_at = w
+            .tick()
+            .wrapping_add(self.lifespan / 2 + 1 + self.rng.below(self.lifespan));
         self.dies_at.push(dies_at);
 
         let id = w.spawn(at.at_height(z));
-        assert_eq!(id.index(), i, "spawn appends, so the game's arrays stay parallel");
+        assert_eq!(
+            id.index(),
+            i,
+            "spawn appends, so the game's arrays stay parallel"
+        );
         if home.is_some() {
             self.residents.push(i as u32);
         }
@@ -693,19 +721,17 @@ impl Game for Herd {
         self.inbound.apply(w);
         // Those spawns appended slots this game has no state for. Give them
         // inert state so every array stays parallel to umwelt's.
-        self.adopt(w.slots());
+        self.adopt(w.id_space());
 
         // Slots are never reused, so this walks every entity that ever lived
-        // and tests each. `LiveSet` has no iterator over the live ones, which
-        // is the cost the design document's word-level skipping note is about,
-        // arriving from the consumer side.
-        let live = w.live().clone();
+        // and tests each. `positions_mut` hands liveness back with the slices,
+        // so the test is available without recording it first.
         let tick = w.tick();
         let cfg = self.cfg;
         let cells = cfg.cells_per_axis() as usize;
         self.occupancy.fill(0);
 
-        let (xs, ys, _) = w.positions_mut();
+        let (xs, ys, _, live) = w.positions_mut();
         for i in 0..xs.len() {
             if !live.contains(EntityId::from_raw(i as u32)) {
                 continue;
@@ -716,7 +742,11 @@ impl Game for Herd {
             // Flapping does not walk anywhere: it steps back and forth across
             // the boundary it was placed on, one crossing a tick.
             if self.pattern == Pattern::Flap {
-                let step = if self.phase_at[i] { self.speed[i] } else { -self.speed[i] };
+                let step = if self.phase_at[i] {
+                    self.speed[i]
+                } else {
+                    -self.speed[i]
+                };
                 self.phase_at[i] = !self.phase_at[i];
                 xs[i] = Fixed::from_raw(xs[i].raw() + step);
                 continue;
@@ -811,7 +841,7 @@ impl Game for Herd {
 
         // Refill toward the population the region was built with, a few at a
         // time so a die-off does not arrive back as one spike.
-        let missing = self.target.saturating_sub(w.live().live());
+        let missing = self.target.saturating_sub(w.entity_count());
         for _ in 0..missing.min(MAX_SPAWNS_PER_TICK) {
             self.spawn_one(w, gathering);
             self.births += 1;
@@ -871,19 +901,22 @@ impl Totals {
     }
 }
 
-/// How the population sits in cells, read through the snapshot a consumer can
-/// see. The checkpoint for movement: whether crowds form on their own.
+/// How the population sits in cells. The checkpoint for movement: whether
+/// crowds form on their own.
+///
+/// Counted by this game rather than read out of umwelt. The cell-ordered
+/// snapshot is umwelt's own working state and not something a consumer is
+/// handed, and this game already tallies its own crowd every tick to steer
+/// away from full cells.
 struct Occupancy {
     max: usize,
 }
 
 fn occupancy<S: PayloadSink>(sim: &WorldSimulation<Herd, S>) -> Occupancy {
-    let snap = sim.snapshot();
-    let cells = snap.cell_count();
-    let counts: Vec<usize> = (0..cells)
-        .map(|i| snap.entities_for_cell(CellId::from_raw(i as u32)).len())
-        .collect();
-    Occupancy { max: counts.iter().copied().max().unwrap_or(0) }
+    let counts = &sim.game().occupancy;
+    Occupancy {
+        max: counts.iter().copied().max().unwrap_or(0) as usize,
+    }
 }
 
 fn main() {
@@ -916,16 +949,26 @@ fn main() {
             "--nats" => nats = args.next().unwrap_or(nats),
             "--region" => region = args.next().and_then(|n| n.parse().ok()).unwrap_or(region),
             "--heartbeat" => {
-                heartbeat = args.next().and_then(|n| n.parse().ok()).unwrap_or(heartbeat)
+                heartbeat = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(heartbeat)
             }
             "--edge-timeout" => {
-                edge_timeout = args.next().and_then(|n| n.parse().ok()).unwrap_or(edge_timeout)
+                edge_timeout = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(edge_timeout)
             }
             "--pattern" => {
-                pattern = args.next().as_deref().and_then(Pattern::parse).unwrap_or_else(|| {
-                    eprintln!("--pattern takes herd, flash, flap, thrash, teleport or cull");
-                    std::process::exit(2)
-                })
+                pattern = args
+                    .next()
+                    .as_deref()
+                    .and_then(Pattern::parse)
+                    .unwrap_or_else(|| {
+                        eprintln!("--pattern takes herd, flash, flap, thrash, teleport or cull");
+                        std::process::exit(2)
+                    })
             }
             other => match other.parse() {
                 Ok(n) => ticks = n,
@@ -972,8 +1015,14 @@ fn main() {
     server.set_heartbeat_interval(Duration::from_secs(heartbeat));
     let sink = EdgeSink::new(region, client, runtime.handle().clone(), Arc::clone(&edges));
 
-    let mut game =
-        Herd::new(&cfg, entities, SEED, lifespan * cfg.tick_hz(), pattern, Arc::clone(&inbound));
+    let mut game = Herd::new(
+        &cfg,
+        entities,
+        SEED,
+        lifespan * cfg.tick_hz(),
+        pattern,
+        Arc::clone(&inbound),
+    );
     game.damage_divisor = damage;
     game.crowd_threshold = crowd;
     let mut sim = WorldSimulation::new(cfg, game).with_sink(Handoff::new(sink.clone()));
@@ -984,7 +1033,13 @@ fn main() {
     // The first tick spawns, so there is nothing to attach a client to before
     // it. Registration is logical: umwelt never sees a socket.
     sim.tick();
-    let avatars: Vec<u32> = sim.game().residents().iter().copied().take(viewers).collect();
+    let avatars: Vec<u32> = sim
+        .game()
+        .residents()
+        .iter()
+        .copied()
+        .take(viewers)
+        .collect();
     let registered = avatars.len();
     for e in avatars {
         sim.register_viewer(EntityId::from_raw(e), herd_common::limits());
@@ -1010,7 +1065,11 @@ fn main() {
         w => println!(
             "Clocked at {} Hz by umwelt, {}: {} ticks is {:.1} minutes of wall clock.",
             cfg.tick_hz(),
-            if w == Wait::Hold { "holding the core" } else { "sleeping to the deadline" },
+            if w == Wait::Hold {
+                "holding the core"
+            } else {
+                "sleeping to the deadline"
+            },
             ticks,
             ticks as f64 / cfg.tick_hz() as f64 / 60.0
         ),
@@ -1023,8 +1082,17 @@ fn main() {
     println!();
     println!(
         "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6}",
-        "tick", "phase", "max cell", "alive", "deaths", "cand", "rec", "dep", "desp",
-        "work ms", "edges"
+        "tick",
+        "phase",
+        "max cell",
+        "alive",
+        "deaths",
+        "cand",
+        "rec",
+        "dep",
+        "desp",
+        "work ms",
+        "edges"
     );
 
     let period = std::time::Duration::from_nanos(1_000_000_000 / cfg.tick_hz() as u64);
@@ -1043,53 +1111,60 @@ fn main() {
     // Zero runs until interrupted, which is what a region with edges attached
     // wants; a fixed count is what a measurement run wants.
     let limit = (ticks > 0).then_some(ticks);
-    let summary = sim.run(Pacing { wait, ticks: limit, ..Pacing::default() }, |r, sim| {
-        // Between ticks is the only place a viewer can be registered or
-        // dropped, which is why this is here and not in the game.
-        inbound.settle(sim, &sink, herd_common::limits());
-        work.record(r.took.as_micros() as u64);
-        if !r.late.is_zero() {
-            late.record(r.late.as_micros() as u64);
-        }
-        if r.took > period {
-            over_budget += 1;
-        }
-        if r.took * 2 > period {
-            over_half += 1;
-        }
-        if r.took * 4 > period * 3 {
-            over_three_quarters += 1;
-        }
-        window_worst = window_worst.max(r.took);
-        totals.add(&r.stats);
+    let summary = sim.run(
+        Pacing {
+            wait,
+            ticks: limit,
+            ..Pacing::default()
+        },
+        |r, sim| {
+            // Between ticks is the only place a viewer can be registered or
+            // dropped, which is why this is here and not in the game.
+            inbound.settle(sim, &sink, herd_common::limits());
+            work.record(r.took.as_micros() as u64);
+            if !r.late.is_zero() {
+                late.record(r.late.as_micros() as u64);
+            }
+            if r.took > period {
+                over_budget += 1;
+            }
+            if r.took * 2 > period {
+                over_half += 1;
+            }
+            if r.took * 4 > period * 3 {
+                over_three_quarters += 1;
+            }
+            window_worst = window_worst.max(r.took);
+            totals.add(&r.stats);
 
-        if r.tick % report_every == 0 {
-            let o = occupancy(sim);
-            let phase = if gathering(r.tick, (PHASE_S * cfg.tick_hz() as i32) as u32) {
-                "gathering"
-            } else {
-                "dispersing"
-            };
-            peak_cell = peak_cell.max(o.max);
-            let served = r.stats.viewers.max(1) as f64;
-            println!(
-                "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7.1} {:>7.1} {:>7.2} {:>7.2} {:>8.2} {:>6}",
-                r.tick,
-                phase,
-                o.max,
-                sim.entity_count(),
-                sim.game().deaths,
-                r.stats.candidates as f64 / served,
-                r.stats.records as f64 / served,
-                r.stats.departed as f64 / served,
-                r.stats.despawns_sent as f64 / served,
-                r.took.as_secs_f64() * 1000.0,
-                edges.len(),
-            );
-            window_worst = std::time::Duration::ZERO;
-        }
-        Flow::Continue
-    });
+            if r.tick % report_every == 0 {
+                let o = occupancy(sim);
+                let phase = if gathering(r.tick, (PHASE_S * cfg.tick_hz() as i32) as u32) {
+                    "gathering"
+                } else {
+                    "dispersing"
+                };
+                peak_cell = peak_cell.max(o.max);
+                let served = r.stats.viewers.max(1) as f64;
+                println!(
+                    "{:>6} {:>10} {:>9} {:>8} {:>8} {:>7.1} {:>7.1} {:>7.2} {:>7.2} {:>8.2} {:>6}",
+                    r.tick,
+                    phase,
+                    o.max,
+                    sim.entity_count(),
+                    sim.game().deaths,
+                    r.stats.candidates as f64 / served,
+                    r.stats.records as f64 / served,
+                    r.stats.departed as f64 / served,
+                    r.stats.despawns_sent as f64 / served,
+                    r.took.as_secs_f64() * 1000.0,
+                    edges.len(),
+                );
+                window_worst = std::time::Duration::ZERO;
+            }
+            Flow::Continue
+        },
+    );
 
     let budget_ms = period.as_secs_f64() * 1000.0;
     println!();
@@ -1225,8 +1300,15 @@ mod tests {
         // Log-spaced buckets, so a quantile names the bucket it landed in
         // rather than interpolating. What has to hold is the ordering and the
         // scale, not an exact value.
-        let (p50, p90, p99) = (h.quantile_us(0.50), h.quantile_us(0.90), h.quantile_us(0.99));
-        assert!(p50 <= p90 && p90 <= p99, "quantiles came out {p50}, {p90}, {p99}");
+        let (p50, p90, p99) = (
+            h.quantile_us(0.50),
+            h.quantile_us(0.90),
+            h.quantile_us(0.99),
+        );
+        assert!(
+            p50 <= p90 && p90 <= p99,
+            "quantiles came out {p50}, {p90}, {p99}"
+        );
         assert!((256..=1_024).contains(&p50), "p50 came out at {p50}");
         assert!((512..=1_024).contains(&p99), "p99 came out at {p99}");
     }
