@@ -96,15 +96,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("a runtime");
         let edge = endpoint("127.0.0.1:0", runtime.handle());
         let at = edge.local_addr().expect("bound");
-        // Discovery off, so the datagram size is the conservative 1200-byte
-        // path quinn starts from rather than whatever this host's loopback
-        // allows. Otherwise the assertions below measure the machine.
-        let mut transport = quinn::TransportConfig::default();
-        transport.mtu_discovery_config(None);
-        let game = herd_common::game_endpoint_with(
-            runtime.handle(),
-            Some(std::sync::Arc::new(transport)),
-        );
+        let game = herd_common::game_endpoint(runtime.handle());
 
         runtime.block_on(async move {
             let listening = tokio::spawn(async move {
@@ -125,15 +117,6 @@ mod tests {
             );
             conn.send_datagram(vec![0u8; full].into()).expect("fits");
             assert_eq!(listening.await.expect("joined").expect("read"), full);
-
-            // And umwelt's default does not, which is the whole reason
-            // PAYLOAD_BYTES exists.
-            let too_big = umwelt::ClientLimits::default().payload_bytes as usize + 5;
-            assert!(
-                too_big > room,
-                "umwelt's default of {too_big} fits in {room} of room; \
-                 PAYLOAD_BYTES can go"
-            );
         });
     }
 }

@@ -119,18 +119,6 @@ pub fn provider() {
 /// against the roots its operator chose, and umwelt neither knows nor asks what
 /// those are.
 pub fn game_endpoint(runtime: &tokio::runtime::Handle) -> quinn::Endpoint {
-    game_endpoint_with(runtime, None)
-}
-
-/// [`game_endpoint`], with the transport configured.
-///
-/// A test pins the MTU through this, so how large a datagram may be does not
-/// depend on the host's loopback: quinn probes upward from 1200 by default, and
-/// a loopback that allows 65536 answers very differently from one that does not.
-pub fn game_endpoint_with(
-    runtime: &tokio::runtime::Handle,
-    transport: Option<std::sync::Arc<quinn::TransportConfig>>,
-) -> quinn::Endpoint {
     provider();
     let mut tls = quinn::rustls::ClientConfig::builder()
         .dangerous()
@@ -147,11 +135,8 @@ pub fn game_endpoint_with(
                 eprintln!("binding a client socket: {e}");
                 std::process::exit(1);
             });
-    let mut client = quinn::ClientConfig::new(std::sync::Arc::new(tls));
-    if let Some(transport) = transport {
-        client.transport_config(transport);
-    }
-    endpoint.set_default_client_config(client);
+    endpoint
+        .set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(tls)));
     endpoint
 }
 
