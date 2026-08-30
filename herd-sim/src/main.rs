@@ -455,7 +455,7 @@ impl Herd {
                 Pattern::Thrash if m > 0 || milli > 0 => {
                     Fixed::from_meters(THRASH_SPEED).raw() / hz
                 }
-                _ => Fixed::from_millis(m, milli).raw() / hz,
+                _ => Fixed::from_millimeters(m, milli).raw() / hz,
             };
             herd.horizon[i] = herd.speed[i].saturating_mul(HORIZON_S * hz);
 
@@ -641,7 +641,7 @@ impl Herd {
             }
             (MIX[class].1, MIX[class].2)
         };
-        let speed = Fixed::from_millis(m, milli).raw() / self.tick_hz;
+        let speed = Fixed::from_millimeters(m, milli).raw() / self.tick_hz;
 
         let resident = speed > 0 && self.rng.below(16) < SPAWN_AT_ATTRACTOR_IN_16;
         let home = resident.then(|| self.rng.below(ATTRACTORS as u32) as u8);
