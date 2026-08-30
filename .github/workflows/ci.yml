@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # herd depends on umwelt by path, so the two have to sit side by side the
+      # way they do in a working copy.
+      - uses: actions/checkout@v7
+        with:
+          path: herd
+      - uses: actions/checkout@v7
+        with:
+          repository: umwelt-sim/umwelt-rs
+          path: umwelt-rs
+
+      - run: rustup update stable && rustup default stable
+      - run: cargo test --locked
+        working-directory: herd
