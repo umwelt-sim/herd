@@ -5,6 +5,11 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://github.com/umwelt-sim/herd/actions/workflows/ci.yml"><img alt="build status"
+     src="https://img.shields.io/github/actions/workflow/status/umwelt-sim/herd/ci.yml?branch=main&amp;logo=github&amp;label=build"></a>
+</p>
+
 # herd
 
 A minimal game, used only to generate load for [umwelt](../umwelt-rs). Never
