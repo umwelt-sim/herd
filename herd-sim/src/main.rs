@@ -674,7 +674,7 @@ impl Herd {
             w.tick().wrapping_add(self.lifespan / 2 + 1 + self.rng.below(self.lifespan));
         self.dies_at.push(dies_at);
 
-        let id = w.spawn(at.at_height(z));
+        let id = w.spawn(at.at_height(z), 0);
         assert_eq!(id.index(), i, "spawn appends, so the game's arrays stay parallel");
         if home.is_some() {
             self.residents.push(i as u32);
@@ -693,7 +693,7 @@ impl Game for Herd {
         let gathering = gathering(w.tick(), (PHASE_S * self.tick_hz) as u32);
         if !self.pending.is_empty() {
             for (i, p) in core::mem::take(&mut self.pending).into_iter().enumerate() {
-                let id = w.spawn(p);
+                let id = w.spawn(p, 0);
                 assert_eq!(id.index(), i, "spawn assigns ids in order from zero");
             }
             return;

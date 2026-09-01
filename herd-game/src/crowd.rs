@@ -79,7 +79,7 @@ impl Crowd {
         };
         for k in 0..observers + unattended {
             let kind =
-                if k < observers { EntityKind::Observer } else { EntityKind::Unattended };
+                if k < observers { EntityKind::observer(0) } else { EntityKind::unattended(0) };
             crowd.ask_for_one(sending, kind)?;
         }
         Ok(crowd)
@@ -151,7 +151,7 @@ impl Crowd {
         // is not there.
         self.held.retain(|h| !leaving.contains(&h.handle));
         for _ in 0..leaving.len() {
-            self.ask_for_one(sending, EntityKind::Observer)?;
+            self.ask_for_one(sending, EntityKind::observer(0))?;
         }
         Ok(leaving.len())
     }
